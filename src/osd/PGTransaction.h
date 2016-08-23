@@ -79,7 +79,7 @@ public:
 	[&](const Init::Create &op) -> bool {
 	  if (source && op.clone_source)
 	    *source = *(op.clone_source);
-	  return static_cast<bool>(op.clone_source);
+	  return op.clone_source != boost::none;
 	},
 	[&](const Init::Rename &op) -> bool {
 	  if (source)
