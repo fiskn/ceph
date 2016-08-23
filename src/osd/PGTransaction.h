@@ -48,8 +48,8 @@ public:
 	boost::optional<hobject_t> clone_source;
 	Create(
 	  bool remove_first,
-	  boost::optional<hobject_t> &&clone_source)
-	  : remove_first(remove_first), clone_source(std::move(clone_source)) {}
+	  const boost::optional<hobject_t> &clone_source)
+	  : remove_first(remove_first), clone_source(clone_source) {}
       };
       struct Rename {
 	hobject_t source; // must be temp object
