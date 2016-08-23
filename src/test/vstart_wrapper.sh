@@ -27,13 +27,18 @@ function vstart_setup()
 {
     rm -fr $CEPH_DEV_DIR $CEPH_OUT_DIR
     mkdir -p $CEPH_DEV_DIR
-    trap "teardown $CEPH_DIR" EXIT
+
+    if [ -z ${VSTART_WRAPPER_SKIP_TEARDOWN+x} ]
+    then
+      trap "teardown $CEPH_DIR" EXIT
+    fi
+
     export LC_ALL=C # some tests are vulnerable to i18n
     export PATH="$(pwd):${PATH}"
     $CEPH_ROOT/src/vstart.sh \
         --short \
         -o 'paxos propose interval = 0.01' \
-        -e -n -l $CEPH_START || return 1
+        -d -e -n -l $CEPH_START || return 1
     export CEPH_CONF=$CEPH_DIR/ceph.conf
 
     crit=$(expr 100 - $(ceph-conf --show-config-value mon_data_avail_crit))
@@ -70,7 +75,12 @@ function main()
 {
     teardown $CEPH_DIR
     vstart_setup || return 1
-    CEPH_CONF=$CEPH_DIR/ceph.conf "$@" || return 1
+    if [ -n ${VSTART_WRAPPER_SKIP_TEARDOWN+x} ]
+    then
+      CEPH_CONF=$CEPH_DIR/ceph.conf "$@" || return 1
+    else
+      ( CEPH_CONF=$CEPH_DIR/ceph.conf "$@" && teardown $CEPH_DIR ) || return 1
+    fi
 }
 
 main "$@"
