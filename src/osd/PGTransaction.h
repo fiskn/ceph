@@ -42,9 +42,8 @@ public:
   public:
     struct Init
     {
-      struct Default {};
-      struct None : Default {};
-      struct Create : Default {
+      struct None {};
+      struct Create {
 	bool remove_first;
 	boost::optional<hobject_t> clone_source;
 	Create(
@@ -52,11 +51,11 @@ public:
 	  boost::optional<hobject_t> &&clone_source)
 	  : remove_first(remove_first), clone_source(std::move(clone_source)) {}
       };
-      struct Rename : Default {
+      struct Rename {
 	hobject_t source; // must be temp object
 	Rename(const hobject_t &source) : source(source) {}
       };
-      struct Delete : Default {};
+      struct Delete {};
     };
     using InitType = boost::variant<
       Init::None,
@@ -79,7 +78,7 @@ public:
 	[&](const Init::Create &op) -> bool {
 	  if (source && op.clone_source)
 	    *source = *(op.clone_source);
-	  return op.clone_source != boost::none;
+	  return op.clone_source == boost::none;
 	},
 	[&](const Init::Rename &op) -> bool {
 	  if (source)
