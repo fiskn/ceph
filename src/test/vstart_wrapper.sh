@@ -49,6 +49,21 @@ This is a limit determined by
 EOF
         return 1
     fi
+ 
+
+    if [ -n ${CREATE_REP_CACHE+x} ]
+    then
+        ceph osd pool create rep-base 4
+        ceph osd pool create rep-cache 4
+        ceph osd tier add rep-base rep-cache
+        ceph osd tier cache-mode rep-cache writeback
+        ceph osd tier set-overlay rep-base rep-cache
+        ceph osd pool set rep-cache hit_set_type bloom
+        ceph osd pool set rep-cache hit_set_count 8
+        ceph osd pool set rep-cache hit_set_period 3600
+        ceph osd pool set rep-cache target_max_objects 250
+        ceph osd pool set rep-cache min_read_recency_for_promote 2
+    fi
 }
 
 function main()
