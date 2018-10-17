@@ -2850,7 +2850,7 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_cache_detail(
 
     if (op->may_write() || op->may_cache()) {
       if (!obc->obs.exists) {
-	//Object doesn't exist in cache tier
+	//Object doesn't exist, must be a new object, write straight to cache tier
 	promote_object(obc, missing_oid, oloc, op, promote_obc);
         return cache_result_t::BLOCKED_PROMOTE;
       } else {
