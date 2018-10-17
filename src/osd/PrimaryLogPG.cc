@@ -2849,7 +2849,13 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_cache_detail(
     }
 
     if (op->may_write() || op->may_cache()) {
-      do_proxy_write(op);
+      if (!obc->obs.exists) {
+	//Object doesn't exist in cache tier
+	promote_object(obc, missing_oid, oloc, op, promote_obc);
+        return cache_result_t::BLOCKED_PROMOTE;
+      } else {
+        do_proxy_write(op);
+      }
 
       // Promote too?
       if (!op->need_skip_promote() && 
