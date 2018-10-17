@@ -39,13 +39,12 @@ void FutureImpl::flush(Context *on_safe) {
         m_contexts.push_back(on_safe);
       }
 
-      prev_future = prepare_flush(&flush_handlers);
+      prev_future = prepare_flush(&flush_handlers, m_lock);
     }
   }
 
   // instruct prior futures to flush as well
   while (prev_future) {
-    Mutex::Locker locker(prev_future->m_lock);
     prev_future = prev_future->prepare_flush(&flush_handlers);
   }
 
@@ -62,7 +61,13 @@ void FutureImpl::flush(Context *on_safe) {
 }
 
 FutureImplPtr FutureImpl::prepare_flush(FlushHandlers *flush_handlers) {
-  assert(m_lock.is_locked());
+  Mutex::Locker locker(m_lock);
+  return prepare_flush(flush_handlers, m_lock);
+}
+
+FutureImplPtr FutureImpl::prepare_flush(FlushHandlers *flush_handlers,
+                                        Mutex &lock) {
+  ceph_assert(m_lock.is_locked());
 
   if (m_flush_state == FLUSH_STATE_NONE) {
     m_flush_state = FLUSH_STATE_REQUESTED;
@@ -75,7 +80,7 @@ FutureImplPtr FutureImpl::prepare_flush(FlushHandlers *flush_handlers) {
 }
 
 void FutureImpl::wait(Context *on_safe) {
-  assert(on_safe != NULL);
+  ceph_assert(on_safe != NULL);
   {
     Mutex::Locker locker(m_lock);
     if (!m_safe || !m_consistent) {
@@ -94,20 +99,20 @@ bool FutureImpl::is_complete() const {
 
 int FutureImpl::get_return_value() const {
   Mutex::Locker locker(m_lock);
-  assert(m_safe && m_consistent);
+  ceph_assert(m_safe && m_consistent);
   return m_return_value;
 }
 
 bool FutureImpl::attach(const FlushHandlerPtr &flush_handler) {
   Mutex::Locker locker(m_lock);
-  assert(!m_flush_handler);
+  ceph_assert(!m_flush_handler);
   m_flush_handler = flush_handler;
   return m_flush_state != FLUSH_STATE_NONE;
 }
 
 void FutureImpl::safe(int r) {
   m_lock.Lock();
-  assert(!m_safe);
+  ceph_assert(!m_safe);
   m_safe = true;
   if (m_return_value == 0) {
     m_return_value = r;
@@ -123,7 +128,7 @@ void FutureImpl::safe(int r) {
 
 void FutureImpl::consistent(int r) {
   m_lock.Lock();
-  assert(!m_consistent);
+  ceph_assert(!m_consistent);
   m_consistent = true;
   m_prev_future.reset();
   if (m_return_value == 0) {
@@ -138,8 +143,8 @@ void FutureImpl::consistent(int r) {
 }
 
 void FutureImpl::finish_unlock() {
-  assert(m_lock.is_locked());
-  assert(m_safe && m_consistent);
+  ceph_assert(m_lock.is_locked());
+  ceph_assert(m_safe && m_consistent);
 
   Contexts contexts;
   contexts.swap(m_contexts);

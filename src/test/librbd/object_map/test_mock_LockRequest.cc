@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #include "test/librbd/test_mock_fixture.h"
@@ -53,7 +53,7 @@ public:
          rados::cls::lock::locker_info_t()}};
 
       bufferlist bl;
-      ::encode(reply, bl, CEPH_FEATURES_SUPPORTED_DEFAULT);
+      encode(reply, bl, CEPH_FEATURES_SUPPORTED_DEFAULT);
 
       std::string str(bl.c_str(), bl.length());
       expect.WillOnce(DoAll(WithArg<5>(CopyInBufferlist(str)), Return(r)));

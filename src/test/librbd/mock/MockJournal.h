@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #ifndef CEPH_TEST_LIBRBD_MOCK_JOURNAL_H
@@ -9,23 +9,32 @@
 #include "librbd/journal/Types.h"
 #include <list>
 
+struct Context;
+struct ContextWQ;
+namespace librados { class IoCtx; }
+
 namespace librbd {
 
-struct AioObjectRequestHandle;
 struct ImageCtx;
 
 struct MockJournal {
-  typedef std::list<AioObjectRequestHandle *> AioObjectRequests;
-
   static MockJournal *s_instance;
   static MockJournal *get_instance() {
-    assert(s_instance != nullptr);
+    ceph_assert(s_instance != nullptr);
     return s_instance;
   }
 
   template <typename ImageCtxT>
   static int is_tag_owner(ImageCtxT *image_ctx, bool *is_tag_owner) {
     return get_instance()->is_tag_owner(is_tag_owner);
+  }
+
+  static void get_tag_owner(librados::IoCtx &,
+                            const std::string &global_image_id,
+                            std::string *tag_owner, ContextWQ *work_queue,
+                            Context *on_finish) {
+    get_instance()->get_tag_owner(global_image_id, tag_owner,
+                                  work_queue, on_finish);
   }
 
   MockJournal() {
@@ -37,6 +46,10 @@ struct MockJournal {
   MOCK_CONST_METHOD0(is_journal_appending, bool());
 
   MOCK_METHOD1(wait_for_journal_ready, void(Context *));
+
+  MOCK_METHOD4(get_tag_owner, void(const std::string &,
+                                   std::string *, ContextWQ *,
+                                   Context *));
 
   MOCK_CONST_METHOD0(is_tag_owner, bool());
   MOCK_CONST_METHOD1(is_tag_owner, int(bool *));
@@ -51,21 +64,6 @@ struct MockJournal {
   MOCK_CONST_METHOD0(get_tag_data, journal::TagData());
 
   MOCK_METHOD0(allocate_op_tid, uint64_t());
-
-  MOCK_METHOD5(append_write_event, uint64_t(uint64_t, size_t,
-                                            const bufferlist &,
-                                            const AioObjectRequests &, bool));
-  MOCK_METHOD5(append_io_event_mock, uint64_t(const journal::EventEntry&,
-                                              const AioObjectRequests &,
-                                              uint64_t, size_t, bool));
-  uint64_t append_io_event(journal::EventEntry &&event_entry,
-                           const AioObjectRequests &requests,
-                           uint64_t offset, size_t length,
-                           bool flush_entry) {
-    // googlemock doesn't support move semantics
-    return append_io_event_mock(event_entry, requests, offset, length,
-                                flush_entry);
-  }
 
   MOCK_METHOD3(append_op_event_mock, void(uint64_t, const journal::EventEntry&,
                                           Context *));

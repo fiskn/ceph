@@ -15,11 +15,6 @@
 #ifndef INTERVAL_MAP_H
 #define INTERVAL_MAP_H
 
-#include <map>
-#include <vector>
-#include <utility>
-#include <boost/optional.hpp>
-#include <iostream>
 #include "include/interval_set.h"
 
 template <typename K, typename V, typename S>
@@ -82,7 +77,7 @@ class interval_map {
 	  std::make_pair(
 	    off,
 	    std::make_pair(len, std::move(n))));
-	assert(p.second);
+	ceph_assert(p.second);
 	niter = p.first;
       }
     }
@@ -102,7 +97,7 @@ class interval_map {
 	std::make_pair(
 	  off,
 	  std::make_pair(len, std::move(n))));
-      assert(p.second);
+      ceph_assert(p.second);
     }
   }
 public:
@@ -163,11 +158,11 @@ public:
     m.insert(to_insert.begin(), to_insert.end());
   }
   void insert(K off, K len, V &&v) {
-    assert(len > 0);
-    assert(len == s.length(v));
+    ceph_assert(len > 0);
+    ceph_assert(len == s.length(v));
     erase(off, len);
     auto p = m.insert(make_pair(off, std::make_pair(len, std::forward<V>(v))));
-    assert(p.second);
+    ceph_assert(p.second);
     try_merge(p.first);
   }
   void insert(interval_map &&other) {
@@ -178,11 +173,11 @@ public:
     }
   }
   void insert(K off, K len, const V &v) {
-    assert(len > 0);
-    assert(len == s.length(v));
+    ceph_assert(len > 0);
+    ceph_assert(len == s.length(v));
     erase(off, len);
     auto p = m.insert(make_pair(off, std::make_pair(len, v)));
-    assert(p.second);
+    ceph_assert(p.second);
     try_merge(p.first);
   }
   void insert(const interval_map &other) {

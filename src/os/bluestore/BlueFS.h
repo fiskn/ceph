@@ -22,11 +22,11 @@ enum {
   l_bluefs_gift_bytes,
   l_bluefs_reclaim_bytes,
   l_bluefs_db_total_bytes,
-  l_bluefs_db_free_bytes,
+  l_bluefs_db_used_bytes,
   l_bluefs_wal_total_bytes,
-  l_bluefs_wal_free_bytes,
+  l_bluefs_wal_used_bytes,
   l_bluefs_slow_total_bytes,
-  l_bluefs_slow_free_bytes,
+  l_bluefs_slow_used_bytes,
   l_bluefs_num_files,
   l_bluefs_log_bytes,
   l_bluefs_log_compactions,
@@ -35,11 +35,13 @@ enum {
   l_bluefs_files_written_sst,
   l_bluefs_bytes_written_wal,
   l_bluefs_bytes_written_sst,
+  l_bluefs_bytes_written_slow,
   l_bluefs_last,
 };
 
 class BlueFS {
 public:
+  CephContext* cct;
   static constexpr unsigned MAX_BDEV = 3;
   static constexpr unsigned BDEV_WAL = 0;
   static constexpr unsigned BDEV_DB = 1;
@@ -74,11 +76,11 @@ public:
 	num_writers(0),
 	num_reading(0)
       {}
-    ~File() {
-      assert(num_readers.load() == 0);
-      assert(num_writers.load() == 0);
-      assert(num_reading.load() == 0);
-      assert(!locked);
+    ~File() override {
+      ceph_assert(num_readers.load() == 0);
+      ceph_assert(num_writers.load() == 0);
+      ceph_assert(num_reading.load() == 0);
+      ceph_assert(!locked);
     }
 
     friend void intrusive_ptr_add_ref(File *f) {
@@ -123,15 +125,18 @@ public:
     bufferlist::page_aligned_appender buffer_appender;  //< for const char* only
     int writer_type = 0;    ///< WRITER_*
 
-    std::mutex lock;
+    ceph::mutex lock = ceph::make_mutex("BlueFS::FileWriter::lock");
     std::array<IOContext*,MAX_BDEV> iocv; ///< for each bdev
+    std::array<bool, MAX_BDEV> dirty_devs;
 
     FileWriter(FileRef f)
       : file(f),
 	pos(0),
-	buffer_appender(buffer.get_page_aligned_appender()) {
+	buffer_appender(buffer.get_page_aligned_appender(
+			  g_conf()->bluefs_alloc_size / CEPH_PAGE_SIZE)) {
       ++file->num_writers;
       iocv.fill(nullptr);
+      dirty_devs.fill(false);
     }
     // NOTE: caller must call BlueFS::close_writer()
     ~FileWriter() {
@@ -214,7 +219,7 @@ public:
   };
 
 private:
-  std::mutex lock;
+  ceph::mutex lock = ceph::make_mutex("BlueFS::lock");
 
   PerfCounters *logger = nullptr;
 
@@ -232,7 +237,7 @@ private:
   FileWriter *log_writer = 0;  ///< writer for the log
   bluefs_transaction_t log_t;  ///< pending, unwritten log transaction
   bool log_flushing = false;   ///< true while flushing the log
-  std::condition_variable log_cond;
+  ceph::condition_variable log_cond;
 
   uint64_t new_log_jump_to = 0;
   uint64_t old_log_jump_to = 0;
@@ -249,9 +254,10 @@ private:
   vector<BlockDevice*> bdev;                  ///< block devices we can use
   vector<IOContext*> ioc;                     ///< IOContexts for bdevs
   vector<interval_set<uint64_t> > block_all;  ///< extents in bdev we own
-  vector<uint64_t> block_total;               ///< sum of block_all
   vector<Allocator*> alloc;                   ///< allocators for bdevs
   vector<interval_set<uint64_t>> pending_release; ///< extents to release
+
+  BlockDevice::aio_callback_t discard_cb[3]; //discard callbacks for each dev
 
   void _init_logger();
   void _shutdown_logger();
@@ -266,26 +272,30 @@ private:
   void _drop_link(FileRef f);
 
   int _allocate(uint8_t bdev, uint64_t len,
-		mempool::bluefs::vector<bluefs_extent_t> *ev);
+		bluefs_fnode_t* node);
   int _flush_range(FileWriter *h, uint64_t offset, uint64_t length);
   int _flush(FileWriter *h, bool force);
-  int _fsync(FileWriter *h, std::unique_lock<std::mutex>& l);
+  int _fsync(FileWriter *h, std::unique_lock<ceph::mutex>& l);
 
-  void _claim_completed_aios(FileWriter *h, list<FS::aio_t> *ls);
+#ifdef HAVE_LIBAIO
+  void _claim_completed_aios(FileWriter *h, list<aio_t> *ls);
   void wait_for_aio(FileWriter *h);  // safe to call without a lock
+#endif
 
-  int _flush_and_sync_log(std::unique_lock<std::mutex>& l,
+  int _flush_and_sync_log(std::unique_lock<ceph::mutex>& l,
 			  uint64_t want_seq = 0,
 			  uint64_t jump_to = 0);
   uint64_t _estimate_log_size();
   bool _should_compact_log();
   void _compact_log_dump_metadata(bluefs_transaction_t *t);
   void _compact_log_sync();
-  void _compact_log_async(std::unique_lock<std::mutex>& l);
+  void _compact_log_async(std::unique_lock<ceph::mutex>& l);
 
   //void _aio_finish(void *priv);
 
+  void _flush_bdev_safely(FileWriter *h);
   void flush_bdev();  // this is safe to call without a lock
+  void flush_bdev(std::array<bool, MAX_BDEV>& dirty_bdevs);  // this is safe to call without a lock
 
   int _preallocate(FileRef f, uint64_t off, uint64_t len);
   int _truncate(FileWriter *h, uint64_t off);
@@ -307,7 +317,7 @@ private:
 
   int _open_super();
   int _write_super();
-  int _replay(bool noop); ///< replay journal
+  int _replay(bool noop, bool to_stdout = false); ///< replay journal
 
   FileWriter *_create_writer(FileRef f);
   void _close_writer(FileWriter *h);
@@ -322,20 +332,27 @@ private:
   }
 
 public:
-  BlueFS();
+  BlueFS(CephContext* cct);
   ~BlueFS();
 
   // the super is always stored on bdev 0
   int mkfs(uuid_d osd_uuid);
   int mount();
   void umount();
+  
+  int log_dump();
 
+  void collect_metadata(map<string,string> *pm, unsigned skip_bdev_id);
+  void get_devices(set<string> *ls);
   int fsck();
 
-  uint64_t get_fs_usage();
+  uint64_t get_used();
   uint64_t get_total(unsigned id);
   uint64_t get_free(unsigned id);
   void get_usage(vector<pair<uint64_t,uint64_t>> *usage); // [<free,total> ...]
+  void dump_perf_counters(Formatter *f);
+
+  void dump_block_extents(ostream& out);
 
   /// get current extents that we own for given block device
   int get_block_extents(unsigned id, interval_set<uint64_t> *extents);
@@ -353,7 +370,7 @@ public:
     bool random = false);
 
   void close_writer(FileWriter *h) {
-    std::lock_guard<std::mutex> l(lock);
+    std::lock_guard l(lock);
     _close_writer(h);
   }
 
@@ -365,6 +382,7 @@ public:
   int unlink(const string& dirname, const string& filename);
   int mkdir(const string& dirname);
   int rmdir(const string& dirname);
+  bool wal_is_rotational();
 
   bool dir_exists(const string& dirname);
   int stat(const string& dirname, const string& filename,
@@ -379,7 +397,7 @@ public:
   /// sync any uncommitted state to disk
   void sync_metadata();
 
-  int add_block_device(unsigned bdev, string path);
+  int add_block_device(unsigned bdev, const string& path, bool trim);
   bool bdev_support_label(unsigned id);
   uint64_t get_block_device_size(unsigned bdev);
 
@@ -388,18 +406,21 @@ public:
 
   /// reclaim block space
   int reclaim_blocks(unsigned bdev, uint64_t want,
-		     uint64_t *offset, uint32_t *length);
+		     PExtentVector *extents);
+
+  // handler for discard event
+  void handle_discard(unsigned dev, interval_set<uint64_t>& to_release);
 
   void flush(FileWriter *h) {
-    std::lock_guard<std::mutex> l(lock);
+    std::lock_guard l(lock);
     _flush(h, false);
   }
   void flush_range(FileWriter *h, uint64_t offset, uint64_t length) {
-    std::lock_guard<std::mutex> l(lock);
+    std::lock_guard l(lock);
     _flush_range(h, offset, length);
   }
   int fsync(FileWriter *h) {
-    std::unique_lock<std::mutex> l(lock);
+    std::unique_lock l(lock);
     return _fsync(h, l);
   }
   int read(FileReader *h, FileReaderBuffer *buf, uint64_t offset, size_t len,
@@ -417,15 +438,15 @@ public:
     return _read_random(h, offset, len, out);
   }
   void invalidate_cache(FileRef f, uint64_t offset, uint64_t len) {
-    std::lock_guard<std::mutex> l(lock);
+    std::lock_guard l(lock);
     _invalidate_cache(f, offset, len);
   }
   int preallocate(FileRef f, uint64_t offset, uint64_t len) {
-    std::lock_guard<std::mutex> l(lock);
+    std::lock_guard l(lock);
     return _preallocate(f, offset, len);
   }
   int truncate(FileWriter *h, uint64_t offset) {
-    std::lock_guard<std::mutex> l(lock);
+    std::lock_guard l(lock);
     return _truncate(h, offset);
   }
 

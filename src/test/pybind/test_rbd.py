@@ -5,30 +5,42 @@ import os
 import time
 import sys
 
+from datetime import datetime
 from nose import with_setup, SkipTest
 from nose.tools import eq_ as eq, assert_raises, assert_not_equal
 from rados import (Rados,
                    LIBRADOS_OP_FLAG_FADVISE_DONTNEED,
                    LIBRADOS_OP_FLAG_FADVISE_NOCACHE,
                    LIBRADOS_OP_FLAG_FADVISE_RANDOM)
-from rbd import (RBD, Image, ImageNotFound, InvalidArgument, ImageExists,
+from rbd import (RBD, Group, Image, ImageNotFound, InvalidArgument, ImageExists,
                  ImageBusy, ImageHasSnapshots, ReadOnlyImage,
-                 FunctionNotSupported, ArgumentOutOfRange, DiskQuotaExceeded,
+                 FunctionNotSupported, ArgumentOutOfRange,
+                 DiskQuotaExceeded, ConnectionShutdown, PermissionError,
                  RBD_FEATURE_LAYERING, RBD_FEATURE_STRIPINGV2,
                  RBD_FEATURE_EXCLUSIVE_LOCK, RBD_FEATURE_JOURNALING,
                  RBD_MIRROR_MODE_DISABLED, RBD_MIRROR_MODE_IMAGE,
                  RBD_MIRROR_MODE_POOL, RBD_MIRROR_IMAGE_ENABLED,
-                 RBD_MIRROR_IMAGE_DISABLED, MIRROR_IMAGE_STATUS_STATE_UNKNOWN)
+                 RBD_MIRROR_IMAGE_DISABLED, MIRROR_IMAGE_STATUS_STATE_UNKNOWN,
+                 RBD_LOCK_MODE_EXCLUSIVE, RBD_OPERATION_FEATURE_GROUP,
+                 RBD_SNAP_NAMESPACE_TYPE_TRASH,
+                 RBD_IMAGE_MIGRATION_STATE_PREPARED, RBD_CONFIG_SOURCE_CONFIG,
+                 RBD_CONFIG_SOURCE_POOL, RBD_CONFIG_SOURCE_IMAGE)
 
 rados = None
 ioctx = None
 features = None
 image_idx = 0
+group_idx = 0
+snap_idx = 0
 image_name = None
+group_name = None
+snap_name = None
 pool_idx = 0
 pool_name = None
 IMG_SIZE = 8 << 20 # 8 MiB
 IMG_ORDER = 22 # 4 MiB objects
+
+os.environ["RBD_FORCE_ALLOW_V1"] = "1"
 
 def setup_module():
     global rados
@@ -39,6 +51,7 @@ def setup_module():
     rados.create_pool(pool_name)
     global ioctx
     ioctx = rados.open_ioctx(pool_name)
+    ioctx.application_enable('rbd')
     global features
     features = os.getenv("RBD_FEATURES")
     features = int(features) if features is not None else 61
@@ -61,6 +74,16 @@ def get_temp_image_name():
     image_idx += 1
     return "image" + str(image_idx)
 
+def get_temp_group_name():
+    global group_idx
+    group_idx += 1
+    return "group" + str(group_idx)
+
+def get_temp_snap_name():
+    global snap_idx
+    snap_idx += 1
+    return "snap" + str(snap_idx)
+
 def create_image():
     global image_name
     image_name = get_temp_image_name()
@@ -73,6 +96,19 @@ def create_image():
 def remove_image():
     if image_name is not None:
         RBD().remove(ioctx, image_name)
+
+def create_group():
+    global group_name
+    group_name = get_temp_group_name()
+    RBD().group_create(ioctx, group_name)
+
+def remove_group():
+    if group_name is not None:
+        RBD().group_remove(ioctx, group_name)
+
+def rename_group():
+    new_group_name = "new" + group_name
+    RBD().group_rename(ioctx, group_name, new_group_name)
 
 def require_new_format():
     def wrapper(fn):
@@ -259,6 +295,18 @@ def test_open_readonly_dne():
         assert_raises(ImageNotFound, Image, ioctx, image_name, 'snap',
                       read_only=True)
 
+@require_new_format()
+def test_open_by_id():
+    with Rados(conffile='') as cluster:
+        with cluster.open_ioctx(pool_name) as ioctx:
+            image_name = get_temp_image_name()
+            RBD().create(ioctx, image_name, IMG_SIZE)
+            with Image(ioctx, image_name) as image:
+                image_id = image.id()
+            with Image(ioctx, image_id=image_id) as image:
+                eq(image.get_name(), image_name)
+            RBD().remove(ioctx, image_name)
+
 def test_remove_dne():
     assert_raises(ImageNotFound, remove_image)
 
@@ -277,6 +325,57 @@ def test_rename():
     eq([image_name2], rbd.list(ioctx))
     rbd.rename(ioctx, image_name2, image_name)
     eq([image_name], rbd.list(ioctx))
+
+def test_pool_metadata():
+    rbd = RBD()
+    metadata = list(rbd.pool_metadata_list(ioctx))
+    eq(len(metadata), 0)
+    assert_raises(KeyError, rbd.pool_metadata_get, ioctx, "key1")
+    rbd.pool_metadata_set(ioctx, "key1", "value1")
+    rbd.pool_metadata_set(ioctx, "key2", "value2")
+    value = rbd.pool_metadata_get(ioctx, "key1")
+    eq(value, "value1")
+    value = rbd.pool_metadata_get(ioctx, "key2")
+    eq(value, "value2")
+    metadata = list(rbd.pool_metadata_list(ioctx))
+    eq(len(metadata), 2)
+    rbd.pool_metadata_remove(ioctx, "key1")
+    metadata = list(rbd.pool_metadata_list(ioctx))
+    eq(len(metadata), 1)
+    eq(metadata[0], ("key2", "value2"))
+    rbd.pool_metadata_remove(ioctx, "key2")
+    assert_raises(KeyError, rbd.pool_metadata_remove, ioctx, "key2")
+    metadata = list(rbd.pool_metadata_list(ioctx))
+    eq(len(metadata), 0)
+
+    N = 65
+    for i in xrange(N):
+        rbd.pool_metadata_set(ioctx, "key" + str(i), "X" * 1025)
+    metadata = list(rbd.pool_metadata_list(ioctx))
+    eq(len(metadata), N)
+    for i in xrange(N):
+        rbd.pool_metadata_remove(ioctx, "key" + str(i))
+        metadata = list(rbd.pool_metadata_list(ioctx))
+        eq(len(metadata), N - i - 1)
+
+def test_config_list():
+    rbd = RBD()
+
+    for option in rbd.config_list(ioctx):
+        eq(option['source'], RBD_CONFIG_SOURCE_CONFIG)
+
+    rbd.pool_metadata_set(ioctx, "conf_rbd_cache", "true")
+
+    for option in rbd.config_list(ioctx):
+        if option['name'] == "rbd_cache":
+            eq(option['source'], RBD_CONFIG_SOURCE_POOL)
+        else:
+            eq(option['source'], RBD_CONFIG_SOURCE_CONFIG)
+
+    rbd.pool_metadata_remove(ioctx, "conf_rbd_cache")
+
+    for option in rbd.config_list(ioctx):
+        eq(option['source'], RBD_CONFIG_SOURCE_CONFIG)
 
 def rand_data(size):
     return os.urandom(size)
@@ -331,6 +430,21 @@ class TestImage(object):
 
     def test_block_name_prefix(self):
         assert_not_equal(b'', self.image.block_name_prefix())
+
+    def test_create_timestamp(self):
+        timestamp = self.image.create_timestamp()
+        assert_not_equal(0, timestamp.year)
+        assert_not_equal(1970, timestamp.year)
+
+    def test_access_timestamp(self):
+        timestamp = self.image.access_timestamp()
+        assert_not_equal(0, timestamp.year)
+        assert_not_equal(1970, timestamp.year)
+
+    def test_modify_timestamp(self):
+        timestamp = self.image.modify_timestamp()
+        assert_not_equal(0, timestamp.year)
+        assert_not_equal(1970, timestamp.year)
 
     def test_invalidate_cache(self):
         self.image.write(b'abc', 0)
@@ -391,6 +505,13 @@ class TestImage(object):
         self.image.resize(new_size)
         info = self.image.stat()
         check_stat(info, new_size, IMG_ORDER)
+
+    def test_resize_allow_shrink_False(self):
+        new_size = IMG_SIZE * 2
+        self.image.resize(new_size)
+        info = self.image.stat()
+        check_stat(info, new_size, IMG_ORDER)
+        assert_raises(InvalidArgument, self.image.resize, IMG_SIZE, False)
 
     def test_size(self):
         eq(IMG_SIZE, self.image.size())
@@ -464,6 +585,57 @@ class TestImage(object):
         self._test_copy(features, self.image.stat()['order'],
                         self.image.stripe_unit(), self.image.stripe_count())
 
+    def test_deep_copy(self):
+        global ioctx
+        global features
+        self.image.write(b'a' * 256, 0)
+        self.image.create_snap('snap1')
+        self.image.write(b'b' * 256, 0)
+        dst_name = get_temp_image_name()
+        self.image.deep_copy(ioctx, dst_name, features=features,
+                             order=self.image.stat()['order'],
+                             stripe_unit=self.image.stripe_unit(),
+                             stripe_count=self.image.stripe_count(),
+                             data_pool=None)
+        self.image.remove_snap('snap1')
+        with Image(ioctx, dst_name, 'snap1') as copy:
+            copy_data = copy.read(0, 256)
+            eq(b'a' * 256, copy_data)
+        with Image(ioctx, dst_name) as copy:
+            copy_data = copy.read(0, 256)
+            eq(b'b' * 256, copy_data)
+            copy.remove_snap('snap1')
+        self.rbd.remove(ioctx, dst_name)
+
+    @require_features([RBD_FEATURE_LAYERING])
+    def test_deep_copy_clone(self):
+        global ioctx
+        global features
+        self.image.write(b'a' * 256, 0)
+        self.image.create_snap('snap1')
+        self.image.write(b'b' * 256, 0)
+        self.image.protect_snap('snap1')
+        clone_name = get_temp_image_name()
+        dst_name = get_temp_image_name()
+        self.rbd.clone(ioctx, image_name, 'snap1', ioctx, clone_name)
+        with Image(ioctx, clone_name) as child:
+            child.create_snap('snap1')
+            child.deep_copy(ioctx, dst_name, features=features,
+                            order=self.image.stat()['order'],
+                            stripe_unit=self.image.stripe_unit(),
+                            stripe_count=self.image.stripe_count(),
+                            data_pool=None)
+            child.remove_snap('snap1')
+
+        with Image(ioctx, dst_name) as copy:
+            copy_data = copy.read(0, 256)
+            eq(b'a' * 256, copy_data)
+            copy.remove_snap('snap1')
+        self.rbd.remove(ioctx, dst_name)
+        self.rbd.remove(ioctx, clone_name)
+        self.image.unprotect_snap('snap1')
+        self.image.remove_snap('snap1')
+
     def test_create_snap(self):
         global ioctx
         self.image.create_snap('snap1')
@@ -521,6 +693,17 @@ class TestImage(object):
         self.image.remove_snap('snap1')
         assert_raises(ImageNotFound, self.image.unprotect_snap, 'snap1')
         assert_raises(ImageNotFound, self.image.is_protected_snap, 'snap1')
+
+    def test_snap_timestamp(self):
+        self.image.create_snap('snap1')
+        eq(['snap1'], [snap['name'] for snap in self.image.list_snaps()])
+        for snap in self.image.list_snaps():
+            snap_id = snap["id"]
+        time = self.image.get_snap_timestamp(snap_id)
+        assert_not_equal(b'', time.year)
+        assert_not_equal(0, time.year)
+        assert_not_equal(time.year, '1970')
+        self.image.remove_snap('snap1')
 
     def test_limit_snaps(self):
         self.image.set_snap_limit(2)
@@ -617,6 +800,7 @@ class TestImage(object):
         self.image.set_snap('snap1')
         read = self.image.read(0, 256)
         eq(read, b'\0' * 256)
+        assert_raises(ReadOnlyImage, self.image.write, data, 0)
         self.image.remove_snap('snap1')
 
     def test_set_no_snap(self):
@@ -631,7 +815,27 @@ class TestImage(object):
         self.image.set_snap('snap1')
         read = self.image.read(0, 256)
         eq(read, b'\0' * 256)
+        assert_raises(ReadOnlyImage, self.image.write, data, 0)
         self.image.set_snap(None)
+        read = self.image.read(0, 256)
+        eq(read, data)
+        self.image.remove_snap('snap1')
+
+    def test_set_snap_by_id(self):
+        self.image.write(b'\0' * 256, 0)
+        self.image.create_snap('snap1')
+        read = self.image.read(0, 256)
+        eq(read, b'\0' * 256)
+        data = rand_data(256)
+        self.image.write(data, 0)
+        read = self.image.read(0, 256)
+        eq(read, data)
+        snaps = list(self.image.list_snaps())
+        self.image.set_snap_by_id(snaps[0]['id'])
+        read = self.image.read(0, 256)
+        eq(read, b'\0' * 256)
+        assert_raises(ReadOnlyImage, self.image.write, data, 0)
+        self.image.set_snap_by_id(None)
         read = self.image.read(0, 256)
         eq(read, data)
         self.image.remove_snap('snap1')
@@ -647,6 +851,7 @@ class TestImage(object):
         self.image.set_snap('snap1')
         read = self.image.read(0, 256)
         eq(read, b'\0' * 256)
+        assert_raises(ReadOnlyImage, self.image.write, data, 0)
         self.image.remove_snap('snap1')
 
     def test_many_snaps(self):
@@ -805,7 +1010,89 @@ class TestImage(object):
         eq(retval[0], 0)
         eq(sys.getrefcount(comp), 2)
 
+    def test_metadata(self):
+        metadata = list(self.image.metadata_list())
+        eq(len(metadata), 0)
+        assert_raises(KeyError, self.image.metadata_get, "key1")
+        self.image.metadata_set("key1", "value1")
+        self.image.metadata_set("key2", "value2")
+        value = self.image.metadata_get("key1")
+        eq(value, "value1")
+        value = self.image.metadata_get("key2")
+        eq(value, "value2")
+        metadata = list(self.image.metadata_list())
+        eq(len(metadata), 2)
+        self.image.metadata_remove("key1")
+        metadata = list(self.image.metadata_list())
+        eq(len(metadata), 1)
+        eq(metadata[0], ("key2", "value2"))
+        self.image.metadata_remove("key2")
+        assert_raises(KeyError, self.image.metadata_remove, "key2")
+        metadata = list(self.image.metadata_list())
+        eq(len(metadata), 0)
 
+        N = 65
+        for i in xrange(N):
+            self.image.metadata_set("key" + str(i), "X" * 1025)
+        metadata = list(self.image.metadata_list())
+        eq(len(metadata), N)
+        for i in xrange(N):
+            self.image.metadata_remove("key" + str(i))
+            metadata = list(self.image.metadata_list())
+            eq(len(metadata), N - i - 1)
+
+    def test_watchers_list(self):
+        watchers = list(self.image.watchers_list())
+        # The image is open (in r/w mode) from setup, so expect there to be one
+        # watcher.
+        eq(len(watchers), 1)
+
+    def test_config_list(self):
+        with Image(ioctx, image_name) as image:
+            for option in image.config_list():
+                eq(option['source'], RBD_CONFIG_SOURCE_CONFIG)
+
+            image.metadata_set("conf_rbd_cache", "true")
+
+            for option in image.config_list():
+                if option['name'] == "rbd_cache":
+                    eq(option['source'], RBD_CONFIG_SOURCE_IMAGE)
+                else:
+                    eq(option['source'], RBD_CONFIG_SOURCE_CONFIG)
+
+            image.metadata_remove("conf_rbd_cache")
+
+            for option in image.config_list():
+                eq(option['source'], RBD_CONFIG_SOURCE_CONFIG)
+
+class TestImageId(object):
+
+    def setUp(self):
+        self.rbd = RBD()
+        create_image()
+        self.image = Image(ioctx, image_name)
+        self.image2 = Image(ioctx, None, None, False, self.image.id())
+
+    def tearDown(self):
+        self.image.close()
+        self.image2.close()
+        remove_image()
+        self.image = None
+        self.image2 = None
+
+    def test_read(self):
+        data = self.image2.read(0, 20)
+        eq(data, b'\0' * 20)
+
+    def test_write(self):
+        data = rand_data(256)
+        self.image2.write(data, 0)
+
+    def test_resize(self):
+        new_size = IMG_SIZE * 2
+        self.image2.resize(new_size)
+        info = self.image2.stat()
+        check_stat(info, new_size, IMG_ORDER)
 
 def check_diff(image, offset, length, from_snapshot, expected):
     extents = []
@@ -883,8 +1170,10 @@ class TestClone(object):
         self.image.create_snap('snap2')
         global features
         clone_name2 = get_temp_image_name()
+        rados.conf_set("rbd_default_clone_format", "1")
         assert_raises(InvalidArgument, self.rbd.clone, ioctx, image_name,
                       'snap2', ioctx, clone_name2, features)
+        rados.conf_set("rbd_default_clone_format", "auto")
         self.image.remove_snap('snap2')
 
     def test_unprotect_with_children(self):
@@ -897,22 +1186,27 @@ class TestClone(object):
         eq(pool, pool_name)
         eq(image, image_name)
         eq(snap, 'snap1')
+        eq(self.image.id(), self.clone.parent_id())
 
         # create a new pool...
         pool_name2 = get_temp_pool_name()
         rados.create_pool(pool_name2)
         other_ioctx = rados.open_ioctx(pool_name2)
+        other_ioctx.application_enable('rbd')
 
         # ...with a clone of the same parent
         other_clone_name = get_temp_image_name()
+        rados.conf_set("rbd_default_clone_format", "1")
         self.rbd.clone(ioctx, image_name, 'snap1', other_ioctx,
                        other_clone_name, features)
+        rados.conf_set("rbd_default_clone_format", "auto")
         self.other_clone = Image(other_ioctx, other_clone_name)
         # validate its parent info
         (pool, image, snap) = self.other_clone.parent_info()
         eq(pool, pool_name)
         eq(image, image_name)
         eq(snap, 'snap1')
+        eq(self.image.id(), self.other_clone.parent_id())
 
         # can't unprotect snap with children
         assert_raises(ImageBusy, self.image.unprotect_snap, 'snap1')
@@ -993,32 +1287,74 @@ class TestClone(object):
         deduped = set([(pool_name, image[1]) for image in actual])
         eq(deduped, set(expected))
 
+    def check_children2(self, expected):
+        actual = list(self.image.list_children2())
+        eq(actual, expected)
+
+    def get_image_id(self, ioctx, name):
+        with Image(ioctx, name) as image:
+            return image.id()
+
     def test_list_children(self):
         global ioctx
         global features
         self.image.set_snap('snap1')
         self.check_children([(pool_name, self.clone_name)])
+        self.check_children2(
+            [{'pool': pool_name, 'image': self.clone_name, 'trash': False,
+              'id': self.get_image_id(ioctx, self.clone_name)}])
         self.clone.close()
         self.rbd.remove(ioctx, self.clone_name)
         eq(self.image.list_children(), [])
+        eq(list(self.image.list_children2()), [])
 
         clone_name = get_temp_image_name() + '_'
         expected_children = []
+        expected_children2 = []
         for i in range(10):
             self.rbd.clone(ioctx, image_name, 'snap1', ioctx,
                            clone_name + str(i), features)
             expected_children.append((pool_name, clone_name + str(i)))
+            expected_children2.append(
+                {'pool': pool_name, 'image': clone_name + str(i), 'trash': False,
+                 'id': self.get_image_id(ioctx, clone_name + str(i))})
             self.check_children(expected_children)
+            self.check_children2(expected_children2)
+
+        image6_id = self.get_image_id(ioctx, clone_name + str(5))
+        RBD().trash_move(ioctx, clone_name + str(5), 0)
+        expected_children.remove((pool_name, clone_name + str(5)))
+        for item in expected_children2:
+          for k, v in item.items():
+            if v == image6_id:
+              item["trash"] = True
+        self.check_children(expected_children)
+        self.check_children2(expected_children2)
+
+        RBD().trash_restore(ioctx, image6_id, clone_name + str(5))
+        expected_children.append((pool_name, clone_name + str(5)))
+        for item in expected_children2:
+          for k, v in item.items():
+            if v == image6_id:
+              item["trash"] = False
+        self.check_children(expected_children)
+        self.check_children2(expected_children2)
 
         for i in range(10):
             self.rbd.remove(ioctx, clone_name + str(i))
-            expected_children.pop(0)
+            expected_children.remove((pool_name, clone_name + str(i)))
+            expected_children2.pop(0)
             self.check_children(expected_children)
+            self.check_children2(expected_children2)
 
         eq(self.image.list_children(), [])
+        eq(list(self.image.list_children2()), [])
         self.rbd.clone(ioctx, image_name, 'snap1', ioctx, self.clone_name,
                        features)
         self.check_children([(pool_name, self.clone_name)])
+        self.check_children2(
+            [{'pool': pool_name, 'image': self.clone_name, 'trash': False,
+              'id': self.get_image_id(ioctx, self.clone_name)}])
         self.clone = Image(ioctx, self.clone_name)
 
     def test_flatten_errors(self):
@@ -1086,6 +1422,8 @@ class TestClone(object):
                 clone.flatten()
                 assert_raises(ImageNotFound, clone.parent_info)
                 assert_raises(ImageNotFound, clone2.parent_info)
+                assert_raises(ImageNotFound, clone.parent_id)
+                assert_raises(ImageNotFound, clone2.parent_id)
                 after_flatten = clone.read(IMG_SIZE // 2, 256)
                 eq(data, after_flatten)
                 after_flatten = clone2.read(IMG_SIZE // 2, 256)
@@ -1123,6 +1461,23 @@ class TestClone(object):
         self.rbd.remove(ioctx, clone_name3)
         self.clone.unprotect_snap('snap2')
         self.clone.remove_snap('snap2')
+
+    def test_trash_snapshot(self):
+        self.image.create_snap('snap2')
+        global features
+        clone_name = get_temp_image_name()
+        rados.conf_set("rbd_default_clone_format", "2")
+        self.rbd.clone(ioctx, image_name, 'snap2', ioctx, clone_name, features)
+        rados.conf_set("rbd_default_clone_format", "auto")
+
+        self.image.remove_snap('snap2')
+
+        snaps = [s for s in self.image.list_snaps() if s['name'] != 'snap1']
+        eq([RBD_SNAP_NAMESPACE_TYPE_TRASH], [s['namespace'] for s in snaps])
+        eq([{'original_name' : 'snap2'}], [s['trash'] for s in snaps])
+
+        self.rbd.remove(ioctx, clone_name)
+        eq([], [s for s in self.image.list_snaps() if s['name'] != 'snap1'])
 
 class TestExclusiveLock(object):
 
@@ -1179,6 +1534,7 @@ class TestExclusiveLock(object):
                 image1.write(data, 0)
                 image2.flatten()
                 assert_raises(ImageNotFound, image1.parent_info)
+                assert_raises(ImageNotFound, image1.parent_id)
                 parent = True
                 for x in range(30):
                     try:
@@ -1243,6 +1599,48 @@ class TestExclusiveLock(object):
             for offset in [0, IMG_SIZE // 2]:
                 read = image2.read(offset, 256)
                 eq(data, read)
+    def test_acquire_release_lock(self):
+        with Image(ioctx, image_name) as image:
+            image.lock_acquire(RBD_LOCK_MODE_EXCLUSIVE)
+            image.lock_release()
+
+    def test_break_lock(self):
+        blacklist_rados = Rados(conffile='')
+        blacklist_rados.connect()
+        try:
+            blacklist_ioctx = blacklist_rados.open_ioctx(pool_name)
+            try:
+                rados2.conf_set('rbd_blacklist_on_break_lock', 'true')
+                with Image(ioctx2, image_name) as image, \
+                     Image(blacklist_ioctx, image_name) as blacklist_image:
+                    blacklist_image.lock_acquire(RBD_LOCK_MODE_EXCLUSIVE)
+                    assert_raises(ReadOnlyImage, image.lock_acquire,
+                                  RBD_LOCK_MODE_EXCLUSIVE)
+
+                    lock_owners = list(image.lock_get_owners())
+                    eq(1, len(lock_owners))
+                    eq(RBD_LOCK_MODE_EXCLUSIVE, lock_owners[0]['mode'])
+                    image.lock_break(RBD_LOCK_MODE_EXCLUSIVE,
+                                     lock_owners[0]['owner'])
+
+                    assert_raises(ConnectionShutdown,
+                                  blacklist_image.is_exclusive_lock_owner)
+
+                    blacklist_rados.wait_for_latest_osdmap()
+                    data = rand_data(256)
+                    assert_raises(ConnectionShutdown,
+                                  blacklist_image.write, data, 0)
+
+                    image.lock_acquire(RBD_LOCK_MODE_EXCLUSIVE)
+
+                    try:
+                        blacklist_image.close()
+                    except ConnectionShutdown:
+                        pass
+            finally:
+                blacklist_ioctx.close()
+        finally:
+            blacklist_rados.shutdown()
 
 class TestMirroring(object):
 
@@ -1372,3 +1770,287 @@ class TestMirroring(object):
         eq(N + 1, len(images))
         for i in range(N):
             self.rbd.remove(ioctx, image_name + str(i))
+
+
+class TestTrash(object):
+
+    def setUp(self):
+        global rados2
+        rados2 = Rados(conffile='')
+        rados2.connect()
+        global ioctx2
+        ioctx2 = rados2.open_ioctx(pool_name)
+
+    def tearDown(self):
+        global ioctx2
+        ioctx2.close()
+        global rados2
+        rados2.shutdown()
+
+    def test_move(self):
+        create_image()
+        with Image(ioctx, image_name) as image:
+            image_id = image.id()
+
+        RBD().trash_move(ioctx, image_name, 1000)
+        RBD().trash_remove(ioctx, image_id, True)
+
+    def test_remove_denied(self):
+        create_image()
+        with Image(ioctx, image_name) as image:
+            image_id = image.id()
+
+        RBD().trash_move(ioctx, image_name, 1000)
+        assert_raises(PermissionError, RBD().trash_remove, ioctx, image_id)
+
+    def test_remove(self):
+        create_image()
+        with Image(ioctx, image_name) as image:
+            image_id = image.id()
+
+        RBD().trash_move(ioctx, image_name, 0)
+        RBD().trash_remove(ioctx, image_id)
+
+    def test_get(self):
+        create_image()
+        with Image(ioctx, image_name) as image:
+            image_id = image.id()
+
+        RBD().trash_move(ioctx, image_name, 1000)
+
+        info = RBD().trash_get(ioctx, image_id)
+        eq(image_id, info['id'])
+        eq(image_name, info['name'])
+        eq('USER', info['source'])
+        assert(info['deferment_end_time'] > info['deletion_time'])
+
+        RBD().trash_remove(ioctx, image_id, True)
+
+    def test_list(self):
+        create_image()
+        with Image(ioctx, image_name) as image:
+            image_id1 = image.id()
+            image_name1 = image_name
+        RBD().trash_move(ioctx, image_name, 1000)
+
+        create_image()
+        with Image(ioctx, image_name) as image:
+            image_id2 = image.id()
+            image_name2 = image_name
+        RBD().trash_move(ioctx, image_name, 1000)
+
+        entries = list(RBD().trash_list(ioctx))
+        for e in entries:
+            if e['id'] == image_id1:
+                eq(e['name'], image_name1)
+            elif e['id'] == image_id2:
+                eq(e['name'], image_name2)
+            else:
+                assert False
+            eq(e['source'], 'USER')
+            assert e['deferment_end_time'] > e['deletion_time']
+
+        RBD().trash_remove(ioctx, image_id1, True)
+        RBD().trash_remove(ioctx, image_id2, True)
+
+    def test_restore(self):
+        create_image()
+        with Image(ioctx, image_name) as image:
+            image_id = image.id()
+        RBD().trash_move(ioctx, image_name, 1000)
+        RBD().trash_restore(ioctx, image_id, image_name)
+        remove_image()
+
+def test_create_group():
+    create_group()
+    remove_group()
+
+def test_rename_group():
+    create_group()
+    if group_name is not None:
+        rename_group()
+        eq(["new" + group_name], RBD().group_list(ioctx))
+        RBD().group_remove(ioctx, "new" + group_name)
+    else:
+        remove_group()
+
+def test_list_groups_empty():
+    eq([], RBD().group_list(ioctx))
+
+@with_setup(create_group, remove_group)
+def test_list_groups():
+    eq([group_name], RBD().group_list(ioctx))
+
+@with_setup(create_group)
+def test_list_groups_after_removed():
+    remove_group()
+    eq([], RBD().group_list(ioctx))
+
+class TestGroups(object):
+
+    def setUp(self):
+        global snap_name
+        self.rbd = RBD()
+        create_image()
+        self.image_names = [image_name]
+        self.image = Image(ioctx, image_name)
+
+        create_group()
+        snap_name = get_temp_snap_name()
+        self.group = Group(ioctx, group_name)
+
+    def tearDown(self):
+        remove_group()
+        self.image = None
+        for name in self.image_names:
+            RBD().remove(ioctx, name)
+
+    def test_group_image_add(self):
+        self.group.add_image(ioctx, image_name)
+
+    def test_group_image_list_empty(self):
+        eq([], list(self.group.list_images()))
+
+    def test_group_image_list(self):
+        eq([], list(self.group.list_images()))
+        self.group.add_image(ioctx, image_name)
+        eq([image_name], [img['name'] for img in self.group.list_images()])
+
+    def test_group_image_many_images(self):
+        eq([], list(self.group.list_images()))
+        self.group.add_image(ioctx, image_name)
+
+        for x in range(0, 20):
+            create_image()
+            self.image_names.append(image_name)
+            self.group.add_image(ioctx, image_name)
+
+        self.image_names.sort()
+        answer = [img['name'] for img in self.group.list_images()]
+        answer.sort()
+        eq(self.image_names, answer)
+
+    def test_group_image_remove(self):
+        eq([], list(self.group.list_images()))
+        self.group.add_image(ioctx, image_name)
+        with Image(ioctx, image_name) as image:
+            eq(RBD_OPERATION_FEATURE_GROUP,
+               image.op_features() & RBD_OPERATION_FEATURE_GROUP)
+            group = image.group()
+            eq(group_name, group['name'])
+
+        eq([image_name], [img['name'] for img in self.group.list_images()])
+        self.group.remove_image(ioctx, image_name)
+        eq([], list(self.group.list_images()))
+        with Image(ioctx, image_name) as image:
+            eq(0, image.op_features() & RBD_OPERATION_FEATURE_GROUP)
+
+    def test_group_snap(self):
+        global snap_name
+        eq([], list(self.group.list_snaps()))
+        self.group.create_snap(snap_name)
+        eq([snap_name], [snap['name'] for snap in self.group.list_snaps()])
+
+        for snap in self.image.list_snaps():
+            eq(rbd.RBD_SNAP_NAMESPACE_TYPE_GROUP, snap['namespace'])
+            info = snap['group']
+            eq(group_name, info['group_name'])
+            eq(snap_name, info['group_snap_name'])
+
+        self.group.remove_snap(snap_name)
+        eq([], list(self.group.list_snaps()))
+
+    def test_group_snap_list_many(self):
+        global snap_name
+        eq([], list(self.group.list_snaps()))
+        snap_names = []
+        for x in range(0, 20):
+            snap_names.append(snap_name)
+            self.group.create_snap(snap_name)
+            snap_name = get_temp_snap_name()
+
+        snap_names.sort()
+        answer = [snap['name'] for snap in self.group.list_snaps()]
+        answer.sort()
+        eq(snap_names, answer)
+
+    def test_group_snap_namespace(self):
+        global snap_name
+        eq([], list(self.group.list_snaps()))
+        self.group.add_image(ioctx, image_name)
+        self.group.create_snap(snap_name)
+        eq(1, len([snap['name'] for snap in self.image.list_snaps()]))
+        self.group.remove_image(ioctx, image_name)
+        self.group.remove_snap(snap_name)
+        eq([], list(self.group.list_snaps()))
+
+    def test_group_snap_rename(self):
+        global snap_name
+        new_snap_name = "new" + snap_name
+
+        eq([], list(self.group.list_snaps()))
+        self.group.create_snap(snap_name)
+        eq([snap_name], [snap['name'] for snap in self.group.list_snaps()])
+        self.group.rename_snap(snap_name, new_snap_name)
+        eq([new_snap_name], [snap['name'] for snap in self.group.list_snaps()])
+        self.group.remove_snap(new_snap_name)
+        eq([], list(self.group.list_snaps()))
+
+    def test_group_snap_rollback(self):
+        eq([], list(self.group.list_images()))
+        self.group.add_image(ioctx, image_name)
+        with Image(ioctx, image_name) as image:
+            image.write(b'\0' * 256, 0)
+            read = image.read(0, 256)
+            eq(read, b'\0' * 256)
+
+        global snap_name
+        eq([], list(self.group.list_snaps()))
+        self.group.create_snap(snap_name)
+        eq([snap_name], [snap['name'] for snap in self.group.list_snaps()])
+
+        with Image(ioctx, image_name) as image:
+            data = rand_data(256)
+            image.write(data, 0)
+            read = image.read(0, 256)
+            eq(read, data)
+
+        self.group.rollback_to_snap(snap_name)
+        with Image(ioctx, image_name) as image:
+            read = image.read(0, 256)
+            eq(read, b'\0' * 256)
+
+        self.group.remove_image(ioctx, image_name)
+        eq([], list(self.group.list_images()))
+        self.group.remove_snap(snap_name)
+        eq([], list(self.group.list_snaps()))
+
+@with_setup(create_image, remove_image)
+def test_rename():
+    rbd = RBD()
+    image_name2 = get_temp_image_name()
+
+class TestMigration(object):
+
+    def test_migration(self):
+        create_image()
+        RBD().migration_prepare(ioctx, image_name, ioctx, image_name, features=63,
+                                order=23, stripe_unit=1<<23, stripe_count=1,
+                                data_pool=None)
+
+        status = RBD().migration_status(ioctx, image_name)
+        eq(image_name, status['source_image_name'])
+        eq(image_name, status['dest_image_name'])
+        eq(RBD_IMAGE_MIGRATION_STATE_PREPARED, status['state'])
+
+        RBD().migration_execute(ioctx, image_name)
+        RBD().migration_commit(ioctx, image_name)
+        remove_image()
+
+    def test_migrate_abort(self):
+        create_image()
+        RBD().migration_prepare(ioctx, image_name, ioctx, image_name, features=63,
+                                order=23, stripe_unit=1<<23, stripe_count=1,
+                                data_pool=None)
+        RBD().migration_abort(ioctx, image_name)
+        remove_image()

@@ -63,7 +63,7 @@ public:
 
   ~CommandTable()
   {
-    assert(commands.empty());
+    ceph_assert(commands.empty());
   }
 
   T& start_command()
@@ -92,6 +92,10 @@ public:
   void erase(ceph_tid_t tid)
   {
     commands.erase(tid);
+  }
+
+  void clear() {
+    commands.clear();
   }
 };
 

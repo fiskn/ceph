@@ -13,6 +13,7 @@
 #include "librbd/journal/Types.h"
 #include <boost/variant.hpp>
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
 
 #undef dout_prefix
@@ -38,7 +39,7 @@ EventPreprocessor<I>::EventPreprocessor(I &local_image_ctx,
 
 template <typename I>
 EventPreprocessor<I>::~EventPreprocessor() {
-  assert(!m_in_progress);
+  ceph_assert(!m_in_progress);
 }
 
 template <typename I>
@@ -52,7 +53,7 @@ bool EventPreprocessor<I>::is_required(const EventEntry &event_entry) {
 template <typename I>
 void EventPreprocessor<I>::preprocess(EventEntry *event_entry,
                                       Context *on_finish) {
-  assert(!m_in_progress);
+  ceph_assert(!m_in_progress);
   m_in_progress = true;
   m_event_entry = event_entry;
   m_on_finish = on_finish;
@@ -106,7 +107,7 @@ int EventPreprocessor<I>::preprocess_snap_rename(
   dout(20) << ": "
            << "remote_snap_id=" << event.snap_id << ", "
            << "src_snap_name=" << event.src_snap_name << ", "
-           << "dest_snap_name=" << event.snap_name << dendl;
+           << "dest_snap_name=" << event.dst_snap_name << dendl;
 
   auto snap_seq_it = m_snap_seqs.find(event.snap_id);
   if (snap_seq_it != m_snap_seqs.end()) {
@@ -116,7 +117,8 @@ int EventPreprocessor<I>::preprocess_snap_rename(
     return 0;
   }
 
-  auto snap_id_it = m_local_image_ctx.snap_ids.find(event.src_snap_name);
+  auto snap_id_it = m_local_image_ctx.snap_ids.find({cls::rbd::UserSnapshotNamespace(),
+						     event.src_snap_name});
   if (snap_id_it == m_local_image_ctx.snap_ids.end()) {
     dout(20) << ": cannot map remote snapshot '" << event.src_snap_name << "' "
              << "to local snapshot" << dendl;
@@ -145,7 +147,7 @@ void EventPreprocessor<I>::update_client() {
 
   librbd::journal::ClientData client_data(client_meta);
   bufferlist data_bl;
-  ::encode(client_data, data_bl);
+  encode(client_data, data_bl);
 
   Context *ctx = create_context_callback<
     EventPreprocessor<I>, &EventPreprocessor<I>::handle_update_client>(

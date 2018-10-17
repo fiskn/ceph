@@ -36,6 +36,7 @@
 // logging is not functional when it is called. cerr output is lost
 // when the caller is daemonized but it will show if not (-f)
 //
+#define dout_context g_ceph_context
 #define dout_prefix *_dout
 #define dout_subsys ceph_subsys_
 
@@ -63,7 +64,7 @@ struct pidfh {
   }
   int verify();
   int remove();
-  int open(const md_config_t *conf);
+  int open(const ConfigProxy& conf);
   int write();
 };
 
@@ -131,7 +132,7 @@ int pidfh::remove()
   return 0;
 }
 
-int pidfh::open(const md_config_t *conf)
+int pidfh::open(const ConfigProxy& conf)
 {
   int len = snprintf(pf_path, sizeof(pf_path),
 		    "%s", conf->pid_file.c_str());
@@ -140,7 +141,7 @@ int pidfh::open(const md_config_t *conf)
     return -ENAMETOOLONG;
 
   int fd;
-  fd = ::open(pf_path, O_CREAT|O_RDWR, 0644);
+  fd = ::open(pf_path, O_CREAT|O_RDWR|O_CLOEXEC, 0644);
   if (fd < 0) {
     int err = errno;
     derr << __func__ << ": failed to open pid file '"
@@ -170,8 +171,14 @@ int pidfh::open(const md_config_t *conf)
   };
   int r = ::fcntl(pf_fd, F_SETLK, &l);
   if (r < 0) {
-    derr << __func__ << ": failed to lock pidfile "
-	 << pf_path << " because another process locked it." << dendl;
+    if (errno == EAGAIN || errno == EACCES) {
+      derr << __func__ << ": failed to lock pidfile "
+	   << pf_path << " because another process locked it" 
+	   << "': " << cpp_strerror(errno) << dendl;
+    } else {
+      derr << __func__ << ": failed to lock pidfile "
+	   << pf_path << "': " << cpp_strerror(errno) << dendl;
+    }
     ::close(pf_fd);
     reset();
     return -errno;
@@ -208,14 +215,14 @@ void pidfile_remove()
   pfh = nullptr;
 }
 
-int pidfile_write(const md_config_t *conf)
+int pidfile_write(const ConfigProxy& conf)
 {
   if (conf->pid_file.empty()) {
     dout(0) << __func__ << ": ignore empty --pid-file" << dendl;
     return 0;
   }
 
-  assert(pfh == nullptr);
+  ceph_assert(pfh == nullptr);
 
   pfh = new pidfh();
   if (atexit(pidfile_remove)) {

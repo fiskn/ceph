@@ -8,6 +8,7 @@ import time
 
 from cStringIO import StringIO
 from teuthology.orchestra import run
+from teuthology.misc import reconnect, get_first_mon, wait_until_healthy
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ def task(ctx, config):
         r = remote.run(args=['sudo', 'ps', '-eaf', run.Raw('|'),
                              'grep', 'ceph'], stdout=StringIO())
         if r.stdout.getvalue().find('Active: inactive'):
-            log.info("Sucessfully stopped all ceph services")
+            log.info("Successfully stopped all ceph services")
         else:
             log.info("Failed to stop ceph services")
 
@@ -54,7 +55,7 @@ def task(ctx, config):
                        stdout=StringIO())
         log.info(r.stdout.getvalue())
         if r.stdout.getvalue().find('Active: active'):
-            log.info("Sucessfully started all Ceph services")
+            log.info("Successfully started all Ceph services")
         else:
             log.info("info", "Failed to start Ceph services")
         r = remote.run(args=['sudo', 'ps', '-eaf', run.Raw('|'),
@@ -82,7 +83,7 @@ def task(ctx, config):
                            stdout=StringIO(), check_status=False)
             log.info(r.stdout.getvalue())
             if r.stdout.getvalue().find('Active: inactive'):
-                log.info("Sucessfully stopped single osd ceph service")
+                log.info("Successfully stopped single osd ceph service")
             else:
                 log.info("Failed to stop ceph osd services")
             remote.run(args=['sudo', 'systemctl', 'start',
@@ -95,7 +96,7 @@ def task(ctx, config):
             r = remote.run(args=['sudo', 'systemctl', 'status', mon_name],
                            stdout=StringIO(), check_status=False)
             if r.stdout.getvalue().find('Active: inactive'):
-                log.info("Sucessfully stopped single mon ceph service")
+                log.info("Successfully stopped single mon ceph service")
             else:
                 log.info("Failed to stop ceph mon service")
             remote.run(args=['sudo', 'systemctl', 'start', mon_name])
@@ -107,7 +108,7 @@ def task(ctx, config):
             r = remote.run(args=['sudo', 'systemctl', 'status', mgr_name],
                            stdout=StringIO(), check_status=False)
             if r.stdout.getvalue().find('Active: inactive'):
-                log.info("Sucessfully stopped single ceph mgr service")
+                log.info("Successfully stopped single ceph mgr service")
             else:
                 log.info("Failed to stop ceph mgr service")
             remote.run(args=['sudo', 'systemctl', 'start', mgr_name])
@@ -119,9 +120,23 @@ def task(ctx, config):
             r = remote.run(args=['sudo', 'systemctl', 'status', mds_name],
                            stdout=StringIO(), check_status=False)
             if r.stdout.getvalue().find('Active: inactive'):
-                log.info("Sucessfully stopped single ceph mds service")
+                log.info("Successfully stopped single ceph mds service")
             else:
                 log.info("Failed to stop ceph mds service")
             remote.run(args=['sudo', 'systemctl', 'start', mds_name])
             time.sleep(4)
+
+    # reboot all nodes and verify the systemd units restart
+    # workunit that runs would fail if any of the systemd unit doesnt start
+    ctx.cluster.run(args='sudo reboot', wait=False, check_status=False)
+    # avoid immediate reconnect
+    time.sleep(120)
+    reconnect(ctx, 480)  # reconnect all nodes
+    # for debug info
+    ctx.cluster.run(args=['sudo', 'ps', '-eaf', run.Raw('|'),
+                          'grep', 'ceph'])
+    # wait for HEALTH_OK
+    mon = get_first_mon(ctx, config)
+    (mon_remote,) = ctx.cluster.only(mon).remotes.iterkeys()
+    wait_until_healthy(ctx, mon_remote, use_sudo=True)
     yield

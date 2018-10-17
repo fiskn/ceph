@@ -20,7 +20,7 @@
 #include "msg/msg_types.h"
 #include "auth/none/AuthNoneProtocol.h" // XXX
 
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 #include "common/dout.h"
 
 extern struct xio_mempool *xio_msgr_mpool;
@@ -100,7 +100,6 @@ XioConnection::XioConnection(XioMessenger *m, XioConnection::type _type,
   in_seq(),
   cstate(this)
 {
-  pthread_spin_init(&sp, PTHREAD_PROCESS_PRIVATE);
   set_peer_type(peer.name.type());
   set_peer_addr(peer.addr);
 
@@ -160,7 +159,7 @@ void XioConnection::send_keepalive_or_ack(bool ack, const utime_t *tp)
 {
   /* If con is not in READY state, we need to queue the request */
   if (cstate.session_state.read() != XioConnection::UP) {
-    pthread_spin_lock(&sp);
+    std::lock_guad<ceph::util::spinlock> lg(sp);
     if (cstate.session_state.read() != XioConnection::UP) {
       if (ack) {
 	outgoing.ack = true;
@@ -169,10 +168,8 @@ void XioConnection::send_keepalive_or_ack(bool ack, const utime_t *tp)
       else {
 	outgoing.keepalive = true;
       }
-      pthread_spin_unlock(&sp);
       return;
     }
-    pthread_spin_unlock(&sp);
   }
 
   send_keepalive_or_ack_internal(ack, tp);
@@ -188,12 +185,12 @@ void XioConnection::send_keepalive_or_ack_internal(bool ack, const utime_t *tp)
 
   struct ceph_timespec ts;
   if (ack) {
-    assert(tp);
+    ceph_assert(tp);
     tp->encode_timeval(&ts);
     xcmd->get_bl_ref().append(CEPH_MSGR_TAG_KEEPALIVE2_ACK);
     xcmd->get_bl_ref().append((char*)&ts, sizeof(ts));
   } else if (has_feature(CEPH_FEATURE_MSGR_KEEPALIVE2)) {
-    utime_t t = ceph_clock_now(msgr->cct);
+    utime_t t = ceph_clock_now();
     t.encode_timeval(&ts);
     xcmd->get_bl_ref().append(CEPH_MSGR_TAG_KEEPALIVE2);
     xcmd->get_bl_ref().append((char*)&ts, sizeof(ts));
@@ -202,9 +199,9 @@ void XioConnection::send_keepalive_or_ack_internal(bool ack, const utime_t *tp)
   }
 
   const std::list<buffer::ptr>& header = xcmd->get_bl_ref().buffers();
-  assert(header.size() == 1);  /* accelio header must be without scatter gather */
+  ceph_assert(header.size() == 1);  /* accelio header must be without scatter gather */
   list<bufferptr>::const_iterator pb = header.begin();
-  assert(pb->length() < XioMsgHdr::get_max_encoded_length());
+  ceph_assert(pb->length() < XioMsgHdr::get_max_encoded_length());
   struct xio_msg * msg = xcmd->get_xio_msg();
   msg->out.header.iov_base = (char*) pb->c_str();
   msg->out.header.iov_len = pb->length();
@@ -289,11 +286,11 @@ int XioConnection::handle_data_msg(struct xio_session *session,
       << " iov_len " << (int) tmsg->in.header.iov_len
       << " nents " << tmsg->in.pdata_iov.nents
       << " sn " << tmsg->sn << dendl;
-    assert(session == this->session);
+    ceph_assert(session == this->session);
     in_seq.set_count(msg_cnt.msg_cnt);
   } else {
     /* XXX major sequence error */
-    assert(! tmsg->in.header.iov_len);
+    ceph_assert(! tmsg->in.header.iov_len);
   }
 
   in_seq.append(msg);
@@ -311,7 +308,7 @@ int XioConnection::handle_data_msg(struct xio_session *session,
   ceph_msg_footer footer;
   buffer::list payload, middle, data;
 
-  const utime_t recv_stamp = ceph_clock_now(msgr->cct);
+  const utime_t recv_stamp = ceph_clock_now();
 
   ldout(msgr->cct,4) << __func__ << " " << "msg_seq.size()="  << msg_seq.size() <<
     dendl;
@@ -347,7 +344,7 @@ int XioConnection::handle_data_msg(struct xio_session *session,
        * split due to coalescing of a segment (front, middle,
        * data) boundary */
 
-      take_len = MIN(blen, msg_iov->iov_len);
+      take_len = std::min(blen, msg_iov->iov_len);
       payload.append(
 	buffer::create_msg(
 	  take_len, (char*) msg_iov->iov_base, m_hook));
@@ -389,7 +386,7 @@ int XioConnection::handle_data_msg(struct xio_session *session,
     iovs = vmsg_sglist(&tmsg->in);
     for (; blen && (ix < iov_len); ++ix) {
       msg_iov = &iovs[ix];
-      take_len = MIN(blen, msg_iov->iov_len);
+      take_len = std::min(blen, msg_iov->iov_len);
       middle.append(
 	buffer::create_msg(
 	  take_len, (char*) msg_iov->iov_base, m_hook));
@@ -433,11 +430,10 @@ int XioConnection::handle_data_msg(struct xio_session *session,
   }
 
   /* update connection timestamp */
-  recv.set(tmsg->timestamp);
+  recv = tmsg->timestamp;
 
-  Message *m =
-    decode_message(msgr->cct, msgr->crcflags, header, footer, payload, middle,
-		   data);
+  Message *m = decode_message(msgr->cct, msgr->crcflags, header, footer,
+                              payload, middle, data, this);
 
   if (m) {
     /* completion */
@@ -452,7 +448,7 @@ int XioConnection::handle_data_msg(struct xio_session *session,
 
     /* update timestamps */
     m->set_recv_stamp(recv_stamp);
-    m->set_recv_complete_stamp(ceph_clock_now(msgr->cct));
+    m->set_recv_complete_stamp(ceph_clock_now());
     m->set_seq(header.seq);
 
     /* MP-SAFE */
@@ -511,7 +507,7 @@ int XioConnection::on_msg(struct xio_session *session,
 
   case CEPH_MSGR_TAG_KEEPALIVE:
     ldout(msgr->cct, 20) << __func__ << " got KEEPALIVE" << dendl;
-    set_last_keepalive(ceph_clock_now(nullptr));
+    set_last_keepalive(ceph_clock_now());
     break;
 
   case CEPH_MSGR_TAG_KEEPALIVE2:
@@ -524,7 +520,7 @@ int XioConnection::on_msg(struct xio_session *session,
       utime_t kp_t = utime_t(*t);
       ldout(msgr->cct, 20) << __func__ << " got KEEPALIVE2 with timestamp" << kp_t << dendl;
       send_keepalive_or_ack(true, &kp_t);
-      set_last_keepalive(ceph_clock_now(nullptr));
+      set_last_keepalive(ceph_clock_now());
     }
 
     break;
@@ -544,7 +540,7 @@ int XioConnection::on_msg(struct xio_session *session,
 
   default:
     lderr(msgr->cct) << __func__ << " unsupported message tag " << (int) tag << dendl;
-    assert(! "unsupported message tag");
+    ceph_assert(! "unsupported message tag");
   }
 
   xio_release_msg(msg);
@@ -613,7 +609,7 @@ void XioConnection::msg_release_fail(struct xio_msg *msg, int code)
 int XioConnection::flush_out_queues(uint32_t flags) {
   XioMessenger* msgr = static_cast<XioMessenger*>(get_messenger());
   if (! (flags & CState::OP_FLAG_LOCKED))
-    pthread_spin_lock(&sp);
+    sp.lock();
 
   if (outgoing.keepalive) {
     outgoing.keepalive = false;
@@ -638,7 +634,7 @@ int XioConnection::flush_out_queues(uint32_t flags) {
     msgr->_send_message_impl(m, this);
   }
   if (! (flags & CState::OP_FLAG_LOCKED))
-    pthread_spin_unlock(&sp);
+    sp.unlock();
   return 0;
 }
 
@@ -648,7 +644,7 @@ int XioConnection::discard_out_queues(uint32_t flags)
   XioSubmit::Queue deferred_q;
 
   if (! (flags & CState::OP_FLAG_LOCKED))
-    pthread_spin_lock(&sp);
+    sp.lock();
 
   /* the two send queues contain different objects:
    * - anything on the mqueue is a Message
@@ -663,7 +659,7 @@ int XioConnection::discard_out_queues(uint32_t flags)
   outgoing.keepalive = outgoing.ack = false;
 
   if (! (flags & CState::OP_FLAG_LOCKED))
-    pthread_spin_unlock(&sp);
+    sp.unlock();
 
   // mqueue
   while (!disc_q.empty()) {
@@ -701,11 +697,11 @@ int XioConnection::discard_out_queues(uint32_t flags)
 int XioConnection::adjust_clru(uint32_t flags)
 {
   if (flags & CState::OP_FLAG_LOCKED)
-    pthread_spin_unlock(&sp);
+    sp.unlock();
 
   XioMessenger* msgr = static_cast<XioMessenger*>(get_messenger());
   msgr->conns_sp.lock();
-  pthread_spin_lock(&sp);
+  sp.lock();
 
   if (cstate.flags & CState::FLAG_MAPPED) {
     XioConnection::ConnList::iterator citer =
@@ -717,7 +713,7 @@ int XioConnection::adjust_clru(uint32_t flags)
   msgr->conns_sp.unlock();
 
   if (! (flags & CState::OP_FLAG_LOCKED))
-    pthread_spin_unlock(&sp);
+    sp.unlock();
 
   return 0;
 }
@@ -743,7 +739,7 @@ void XioConnection::mark_down()
 int XioConnection::_mark_down(uint32_t flags)
 {
   if (! (flags & CState::OP_FLAG_LOCKED))
-    pthread_spin_lock(&sp);
+    sp.lock();
 
   // per interface comment, we only stage a remote reset if the
   // current policy required it
@@ -757,7 +753,7 @@ int XioConnection::_mark_down(uint32_t flags)
   discard_out_queues(flags|CState::OP_FLAG_LOCKED);
 
   if (! (flags & CState::OP_FLAG_LOCKED))
-    pthread_spin_unlock(&sp);
+    sp.unlock();
 
   return 0;
 }
@@ -770,12 +766,12 @@ void XioConnection::mark_disposable()
 int XioConnection::_mark_disposable(uint32_t flags)
 {
   if (! (flags & CState::OP_FLAG_LOCKED))
-    pthread_spin_lock(&sp);
+    sp.lock();
 
   cstate.policy.lossy = true;
 
   if (! (flags & CState::OP_FLAG_LOCKED))
-    pthread_spin_unlock(&sp);
+    sp.unlock();
 
   return 0;
 }
@@ -783,23 +779,23 @@ int XioConnection::_mark_disposable(uint32_t flags)
 int XioConnection::CState::state_up_ready(uint32_t flags)
 {
   if (! (flags & CState::OP_FLAG_LOCKED))
-    pthread_spin_lock(&xcon->sp);
+    xcon->sp.lock();
 
   xcon->flush_out_queues(flags|CState::OP_FLAG_LOCKED);
 
-  session_state.set(UP);
-  startup_state.set(READY);
+  session_state = session_states::UP;
+  startup_state = session_startup_states::READY;
 
   if (! (flags & CState::OP_FLAG_LOCKED))
-    pthread_spin_unlock(&xcon->sp);
+    xcon->sp.unlock();
 
   return (0);
 }
 
 int XioConnection::CState::state_discon()
 {
-  session_state.set(DISCONNECTED);
-  startup_state.set(IDLE);
+  session_state = session_states::DISCONNECTED;
+  startup_state = session_startup_states::IDLE;
 
   return 0;
 }
@@ -807,12 +803,12 @@ int XioConnection::CState::state_discon()
 int XioConnection::CState::state_flow_controlled(uint32_t flags)
 {
   if (! (flags & OP_FLAG_LOCKED))
-    pthread_spin_lock(&xcon->sp);
+    xcon->sp.lock();
 
-  session_state.set(FLOW_CONTROLLED);
+  session_state = session_states::FLOW_CONTROLLED;
 
   if (! (flags & OP_FLAG_LOCKED))
-    pthread_spin_unlock(&xcon->sp);
+    xcon->sp.unlock();
 
   return (0);
 }
@@ -820,11 +816,11 @@ int XioConnection::CState::state_flow_controlled(uint32_t flags)
 int XioConnection::CState::state_fail(Message* m, uint32_t flags)
 {
   if (! (flags & OP_FLAG_LOCKED))
-    pthread_spin_lock(&xcon->sp);
+    xcon->sp.lock();
 
   // advance to state FAIL, drop queued, msgs, adjust LRU
-  session_state.set(DISCONNECTED);
-  startup_state.set(FAIL);
+  session_state = session_states::DISCONNECTED;
+  startup_state = session_startup_states::FAIL;
 
   xcon->discard_out_queues(flags|OP_FLAG_LOCKED);
   xcon->adjust_clru(flags|OP_FLAG_LOCKED|OP_FLAG_LRU);
@@ -832,7 +828,7 @@ int XioConnection::CState::state_fail(Message* m, uint32_t flags)
   xcon->disconnect();
 
   if (! (flags & OP_FLAG_LOCKED))
-    pthread_spin_unlock(&xcon->sp);
+    xcon->sp.unlock();
 
   // notify ULP
   XioMessenger* msgr = static_cast<XioMessenger*>(xcon->get_messenger());
@@ -855,7 +851,7 @@ int XioLoopbackConnection::send_message(Message *m)
 
 void XioLoopbackConnection::send_keepalive()
 {
-  utime_t t = ceph_clock_now(nullptr);
+  utime_t t = ceph_clock_now();
   set_last_keepalive(t);
   set_last_keepalive_ack(t);
 }

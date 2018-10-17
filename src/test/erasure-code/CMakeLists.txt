@@ -1,47 +1,37 @@
-add_ceph_test(test-erasure-code-plugins.sh ${CMAKE_CURRENT_SOURCE_DIR}/test-erasure-code-plugins.sh)
-
-add_ceph_test(test-erasure-code.sh ${CMAKE_CURRENT_SOURCE_DIR}/test-erasure-code.sh)
-#add_ceph_test(test-erasure-eio.sh ${CMAKE_CURRENT_SOURCE_DIR}/test-erasure-eio.sh)
 
 add_executable(ceph_erasure_code_benchmark 
   ${CMAKE_SOURCE_DIR}/src/erasure-code/ErasureCode.cc
   ceph_erasure_code_benchmark.cc)
-target_link_libraries(ceph_erasure_code_benchmark common ${Boost_PROGRAM_OPTIONS_LIBRARY} global ${CMAKE_DL_LIBS})
+target_link_libraries(ceph_erasure_code_benchmark ceph-common Boost::program_options global ${CMAKE_DL_LIBS})
 install(TARGETS ceph_erasure_code_benchmark
   DESTINATION bin)
 
 add_executable(ceph_erasure_code_non_regression ceph_erasure_code_non_regression.cc)
-target_link_libraries(ceph_erasure_code_non_regression common ${Boost_PROGRAM_OPTIONS_LIBRARY} global ${CMAKE_DL_LIBS})
+target_link_libraries(ceph_erasure_code_non_regression ceph-common Boost::program_options global ${CMAKE_DL_LIBS})
 
 add_executable(ceph_erasure_code ceph_erasure_code.cc)
-target_link_libraries(ceph_erasure_code common ${Boost_PROGRAM_OPTIONS_LIBRARY} global ${CMAKE_DL_LIBS})
+target_link_libraries(ceph_erasure_code ceph-common Boost::program_options global ${CMAKE_DL_LIBS})
 install(TARGETS ceph_erasure_code
   DESTINATION bin)
 
 add_library(ec_example SHARED 
   ErasureCodePluginExample.cc
   $<TARGET_OBJECTS:erasure_code_objs>)
-add_dependencies(ec_example ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
 target_link_libraries(ec_example pthread ${EXTRALIBS})
 
 add_library(ec_missing_entry_point SHARED ErasureCodePluginMissingEntryPoint.cc)
-add_dependencies(ec_missing_entry_point ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
 target_link_libraries(ec_missing_entry_point pthread ${EXTRALIBS})
 
 add_library(ec_missing_version SHARED ErasureCodePluginMissingVersion.cc)
-add_dependencies(ec_missing_version ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
 target_link_libraries(ec_missing_version pthread ${EXTRALIBS})
 
 add_library(ec_hangs SHARED ErasureCodePluginHangs.cc)
-add_dependencies(ec_hangs ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
 target_link_libraries(ec_hangs pthread ${EXTRALIBS})
 
 add_library(ec_fail_to_initialize SHARED ErasureCodePluginFailToInitialize.cc)
-add_dependencies(ec_fail_to_initialize ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
 target_link_libraries(ec_fail_to_initialize pthread ${EXTRALIBS})
 
 add_library(ec_fail_to_register SHARED ErasureCodePluginFailToRegister.cc)
-add_dependencies(ec_fail_to_register ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
 target_link_libraries(ec_fail_to_register pthread ${EXTRALIBS})
 
 # unittest_erasure_code_plugin
@@ -50,12 +40,12 @@ add_executable(unittest_erasure_code_plugin
   TestErasureCodePlugin.cc
   $<TARGET_OBJECTS:unit-main>
   )
-add_ceph_unittest(unittest_erasure_code_plugin ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_plugin)
+add_ceph_unittest(unittest_erasure_code_plugin)
 target_link_libraries(unittest_erasure_code_plugin
   global
   ${CMAKE_DL_LIBS}
   ec_example
-  common
+  ceph-common
   )
 add_dependencies(unittest_erasure_code_plugin
   ec_example
@@ -71,10 +61,10 @@ add_executable(unittest_erasure_code
   TestErasureCode.cc
   $<TARGET_OBJECTS:unit-main>
   )
-add_ceph_unittest(unittest_erasure_code ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code)
+add_ceph_unittest(unittest_erasure_code)
 target_link_libraries(unittest_erasure_code
   global
-  common
+  ceph-common
   )
 
 # unittest_erasure_code_plugin_jerasure
@@ -82,10 +72,10 @@ add_executable(unittest_erasure_code_plugin_jerasure
   TestErasureCodePluginJerasure.cc
   $<TARGET_OBJECTS:unit-main>
   )
-add_ceph_unittest(unittest_erasure_code_plugin_jerasure ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_plugin_jerasure)
+add_ceph_unittest(unittest_erasure_code_plugin_jerasure)
 target_link_libraries(unittest_erasure_code_plugin_jerasure
   global
-  common)
+  ceph-common)
 add_dependencies(unittest_erasure_code_plugin_jerasure
   ec_jerasure)
 
@@ -97,10 +87,10 @@ add_executable(unittest_erasure_code_isa
   TestErasureCodeIsa.cc
   $<TARGET_OBJECTS:unit-main>
   )
-add_ceph_unittest(unittest_erasure_code_isa ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_isa)
+add_ceph_unittest(unittest_erasure_code_isa)
 target_link_libraries(unittest_erasure_code_isa
   global
-  common
+  ceph-common
   ec_isa
   erasure_code
   )
@@ -111,11 +101,10 @@ add_executable(unittest_erasure_code_plugin_isa
   TestErasureCodePluginIsa.cc
   $<TARGET_OBJECTS:unit-main>
   )
-add_ceph_unittest(unittest_erasure_code_plugin_isa ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_plugin_isa)
+add_ceph_unittest(unittest_erasure_code_plugin_isa)
 target_link_libraries(unittest_erasure_code_plugin_isa
   global
-  common
-  crush
+  ceph-common
   ${CMAKE_DL_LIBS}
   erasure_code
   )
@@ -127,12 +116,12 @@ endif(HAVE_BETTER_YASM_ELF64)
 add_executable(unittest_erasure_code_lrc
   TestErasureCodeLrc.cc
   $<TARGET_OBJECTS:unit-main>)
-add_ceph_unittest(unittest_erasure_code_lrc ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_lrc)
+add_ceph_unittest(unittest_erasure_code_lrc)
 target_link_libraries(unittest_erasure_code_lrc
   global
   ${CMAKE_DL_LIBS}
   ec_lrc
-  common
+  ceph-common
   )
 
 # unittest_erasure_code_plugin_lrc
@@ -140,25 +129,25 @@ add_executable(unittest_erasure_code_plugin_lrc
   TestErasureCodePluginLrc.cc
   $<TARGET_OBJECTS:unit-main>
   )
-add_ceph_unittest(unittest_erasure_code_plugin_lrc ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_plugin_lrc)
+add_ceph_unittest(unittest_erasure_code_plugin_lrc)
 add_dependencies(unittest_erasure_code_plugin_lrc 
   ec_lrc
   ec_jerasure)
 target_link_libraries(unittest_erasure_code_plugin_lrc
   global
   ${CMAKE_DL_LIBS}
-  common)
+  ceph-common)
 
 # unittest_erasure_code_plugin_shec
 add_executable(unittest_erasure_code_plugin_shec
   TestErasureCodePluginShec.cc
   $<TARGET_OBJECTS:unit-main>
   )
-add_ceph_unittest(unittest_erasure_code_plugin_shec ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_plugin_shec)
+add_ceph_unittest(unittest_erasure_code_plugin_shec)
 target_link_libraries(unittest_erasure_code_plugin_shec
   global
   ${CMAKE_DL_LIBS}
-  common)
+  ceph-common)
 add_dependencies(unittest_erasure_code_plugin_shec 
   ec_shec)
 
@@ -168,28 +157,27 @@ add_executable(unittest_erasure_code_example
   TestErasureCodeExample.cc
   $<TARGET_OBJECTS:unit-main>
 )
-add_ceph_unittest(unittest_erasure_code_example ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_example)
+add_ceph_unittest(unittest_erasure_code_example)
 target_link_libraries(unittest_erasure_code_example
   global
   ${CMAKE_DL_LIBS}
-  common
+  ceph-common
   erasure_code
   ${UNITTEST_LIBS}
   )
-set_target_properties(unittest_erasure_code_example PROPERTIES COMPILE_FLAGS ${UNITTEST_CXX_FLAGS})
 
-include_directories(${CMAKE_SOURCE_DIR}/src/erasure-code/jerasure/jerasure/include)
-include_directories(${CMAKE_SOURCE_DIR}/src/erasure-code//jerasure/gf-complete/include)
+include_directories(SYSTEM ${CMAKE_SOURCE_DIR}/src/erasure-code/jerasure/jerasure/include)
+include_directories(SYSTEM ${CMAKE_SOURCE_DIR}/src/erasure-code//jerasure/gf-complete/include)
 
 # unittest_erasure_code_jerasure
 add_executable(unittest_erasure_code_jerasure
   TestErasureCodeJerasure.cc
   $<TARGET_OBJECTS:unit-main>
   )
-add_ceph_unittest(unittest_erasure_code_jerasure ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_jerasure)
+add_ceph_unittest(unittest_erasure_code_jerasure)
 target_link_libraries(unittest_erasure_code_jerasure
   global
-  common
+  ceph-common
   ec_jerasure
   )
 
@@ -201,11 +189,11 @@ add_executable(unittest_erasure_code_shec
   TestErasureCodeShec.cc
   $<TARGET_OBJECTS:unit-main>
   )
-add_ceph_unittest(unittest_erasure_code_shec ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_shec)
+add_ceph_unittest(unittest_erasure_code_shec)
 target_link_libraries(unittest_erasure_code_shec
   global
   ${CMAKE_DL_LIBS}
-  common
+  ceph-common
   ec_shec
   )
 
@@ -213,11 +201,11 @@ target_link_libraries(unittest_erasure_code_shec
 add_executable(unittest_erasure_code_shec_all
   TestErasureCodeShec_all.cc
   )
-add_ceph_unittest(unittest_erasure_code_shec_all ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_shec_all)
+add_ceph_unittest(unittest_erasure_code_shec_all parallel)
 target_link_libraries(unittest_erasure_code_shec_all
   global
   ${CMAKE_DL_LIBS}
-  common
+  ceph-common
   ec_shec
   )
 
@@ -226,11 +214,11 @@ add_executable(unittest_erasure_code_shec_thread
   TestErasureCodeShec_thread.cc
   $<TARGET_OBJECTS:unit-main>
   )
-add_ceph_unittest(unittest_erasure_code_shec_thread ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_shec_thread)
+add_ceph_unittest(unittest_erasure_code_shec_thread)
 target_link_libraries(unittest_erasure_code_shec_thread
   global
   ${CMAKE_DL_LIBS}
-  common
+  ceph-common
   ec_shec
   )
 
@@ -239,10 +227,38 @@ target_link_libraries(unittest_erasure_code_shec_thread
 add_executable(unittest_erasure_code_shec_arguments
   TestErasureCodeShec_arguments.cc
   )
-add_ceph_unittest(unittest_erasure_code_shec_arguments ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_shec_arguments)
+add_ceph_unittest(unittest_erasure_code_shec_arguments)
 target_link_libraries(unittest_erasure_code_shec_arguments
   global
   ${CMAKE_DL_LIBS}
-  common
+  ceph-common
   ec_shec
   )
+
+#unitest_erasure_code_clay
+add_executable(unittest_erasure_code_clay
+  TestErasureCodeClay.cc
+  $<TARGET_OBJECTS:unit-main>)
+add_ceph_unittest(unittest_erasure_code_clay)
+target_link_libraries(unittest_erasure_code_clay
+  global
+  ${CMAKE_DL_LIBS}
+  ${UNITTEST_LIBS}
+  ceph-common
+  ec_clay
+  )
+
+# unittest_erasure_code_plugin_clay
+add_executable(unittest_erasure_code_plugin_clay
+  TestErasureCodePluginClay.cc
+  $<TARGET_OBJECTS:unit-main>)
+add_ceph_unittest(unittest_erasure_code_plugin_clay)
+add_dependencies(unittest_erasure_code_plugin_clay
+  ec_clay)
+target_link_libraries(unittest_erasure_code_plugin_clay
+  GTest::Main
+  global
+  ${CMAKE_DL_LIBS}
+  ${UNITTEST_LIBS}
+  ceph-common)
+

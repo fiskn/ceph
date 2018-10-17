@@ -18,32 +18,36 @@
 #include "msg/Message.h"
 #include "include/types.h"
 
-class MExportDirCancel : public Message {
+class MExportDirCancel : public MessageInstance<MExportDirCancel> {
+public:
+  friend factory;
+private:
   dirfrag_t dirfrag;
 
  public:
-  dirfrag_t get_dirfrag() { return dirfrag; }
+  dirfrag_t get_dirfrag() const { return dirfrag; }
 
-  MExportDirCancel() : Message(MSG_MDS_EXPORTDIRCANCEL) {}
+protected:
+  MExportDirCancel() : MessageInstance(MSG_MDS_EXPORTDIRCANCEL) {}
   MExportDirCancel(dirfrag_t df, uint64_t tid) :
-    Message(MSG_MDS_EXPORTDIRCANCEL), dirfrag(df) {
+    MessageInstance(MSG_MDS_EXPORTDIRCANCEL), dirfrag(df) {
     set_tid(tid);
   }
-private:
-  ~MExportDirCancel() {}
+  ~MExportDirCancel() override {}
 
 public:
-  const char *get_type_name() const { return "ExCancel"; }
-  void print(ostream& o) const {
+  const char *get_type_name() const override { return "ExCancel"; }
+  void print(ostream& o) const override {
     o << "export_cancel(" << dirfrag << ")";
   }
 
-  void encode_payload(uint64_t features) {
-    ::encode(dirfrag, payload);
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
+    encode(dirfrag, payload);
   }
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
-    ::decode(dirfrag, p);
+  void decode_payload() override {
+    auto p = payload.cbegin();
+    decode(dirfrag, p);
   }
 };
 

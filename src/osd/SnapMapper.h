@@ -29,7 +29,7 @@
 
 class OSDriver : public MapCacher::StoreDriver<std::string, bufferlist> {
   ObjectStore *os;
-  coll_t cid;
+  ObjectStore::CollectionHandle ch;
   ghobject_t hoid;
 
 public:
@@ -39,38 +39,41 @@ public:
     ghobject_t hoid;
     ObjectStore::Transaction *t;
     OSTransaction(
-      coll_t cid,
+      const coll_t &cid,
       const ghobject_t &hoid,
       ObjectStore::Transaction *t)
       : cid(cid), hoid(hoid), t(t) {}
   public:
     void set_keys(
-      const std::map<std::string, bufferlist> &to_set) {
+      const std::map<std::string, bufferlist> &to_set) override {
       t->omap_setkeys(cid, hoid, to_set);
     }
     void remove_keys(
-      const std::set<std::string> &to_remove) {
+      const std::set<std::string> &to_remove) override {
       t->omap_rmkeys(cid, hoid, to_remove);
     }
     void add_callback(
-      Context *c) {
+      Context *c) override {
       t->register_on_applied(c);
     }
   };
 
   OSTransaction get_transaction(
     ObjectStore::Transaction *t) {
-    return OSTransaction(cid, hoid, t);
+    return OSTransaction(ch->cid, hoid, t);
   }
 
-  OSDriver(ObjectStore *os, coll_t cid, const ghobject_t &hoid) :
-    os(os), cid(cid), hoid(hoid) {}
+  OSDriver(ObjectStore *os, const coll_t& cid, const ghobject_t &hoid) :
+    os(os),
+    hoid(hoid) {
+    ch = os->open_collection(cid);
+  }
   int get_keys(
     const std::set<std::string> &keys,
-    std::map<std::string, bufferlist> *out);
+    std::map<std::string, bufferlist> *out) override;
   int get_next(
     const std::string &key,
-    pair<std::string, bufferlist> *next);
+    pair<std::string, bufferlist> *next) override;
 };
 
 /**
@@ -97,6 +100,7 @@ public:
  */
 class SnapMapper {
 public:
+  CephContext* cct;
   struct object_snaps {
     hobject_t oid;
     std::set<snapid_t> snaps;
@@ -104,7 +108,7 @@ public:
       : oid(oid), snaps(snaps) {}
     object_snaps() {}
     void encode(bufferlist &bl) const;
-    void decode(bufferlist::iterator &bp);
+    void decode(bufferlist::const_iterator &bp);
   };
 
 private:
@@ -140,9 +144,7 @@ private:
     MapCacher::Transaction<std::string, bufferlist> *t);
 
   // True if hoid belongs in this mapping based on mask_bits and match
-  bool check(const hobject_t &hoid) const {
-    return hoid.match(mask_bits, match);
-  }
+  bool check(const hobject_t &hoid) const;
 
   int _remove_oid(
     const hobject_t &oid,    ///< [in] oid to remove
@@ -155,7 +157,7 @@ public:
       return string();
     char buf[20];
     int r = snprintf(buf, sizeof(buf), ".%x", (int)shard);
-    assert(r < (int)sizeof(buf));
+    ceph_assert(r < (int)sizeof(buf));
     return string(buf, r) + '_';
   }
   uint32_t mask_bits;
@@ -165,23 +167,23 @@ public:
   const shard_id_t shard;
   const string shard_prefix;
   SnapMapper(
+    CephContext* cct,
     MapCacher::StoreDriver<std::string, bufferlist> *driver,
     uint32_t match,  ///< [in] pgid
     uint32_t bits,   ///< [in] current split bits
     int64_t pool,    ///< [in] pool
     shard_id_t shard ///< [in] shard
     )
-    : backend(driver), mask_bits(bits), match(match), pool(pool),
+    : cct(cct), backend(driver), mask_bits(bits), match(match), pool(pool),
       shard(shard), shard_prefix(make_shard_prefix(shard)) {
     update_bits(mask_bits);
   }
 
   set<string> prefixes;
-  /// Update bits in case of pg split
+  /// Update bits in case of pg split or merge
   void update_bits(
     uint32_t new_bits  ///< [in] new split bits
     ) {
-    assert(new_bits >= mask_bits);
     mask_bits = new_bits;
     set<string> _prefixes = hobject_t::get_prefixes(
       mask_bits,

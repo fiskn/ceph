@@ -16,7 +16,13 @@
 #ifndef MDS_CONTEXT_H
 #define MDS_CONTEXT_H
 
+#include <vector>
+#include <deque>
+
 #include "include/Context.h"
+#include "include/elist.h"
+#include "include/spinlock.h"
+#include "common/ceph_time.h"
 
 class MDSRank;
 
@@ -42,7 +48,15 @@ protected:
 class MDSInternalContextBase : public MDSContext
 {
 public:
-    void complete(int r);
+    template<template<typename> class A>
+    using vec_alloc = std::vector<MDSInternalContextBase *, A<MDSInternalContextBase *>>;
+    using vec = vec_alloc<std::allocator>;
+
+    template<template<typename> class A>
+    using que_alloc = std::deque<MDSInternalContextBase *, A<MDSInternalContextBase *>>;
+    using que = que_alloc<std::allocator>;
+
+    void complete(int r) override;
 };
 
 /**
@@ -52,11 +66,11 @@ class MDSInternalContext : public MDSInternalContextBase
 {
 protected:
   MDSRank *mds;
-  virtual MDSRank* get_mds();
+  MDSRank* get_mds() override;
 
 public:
   explicit MDSInternalContext(MDSRank *mds_) : mds(mds_) {
-    assert(mds != NULL);
+    ceph_assert(mds != NULL);
   }
 };
 
@@ -69,16 +83,33 @@ class MDSInternalContextWrapper : public MDSInternalContextBase
 protected:
   MDSRank *mds;
   Context *fin;
-  MDSRank *get_mds();
+  MDSRank *get_mds() override;
+  void finish(int r) override;
 public:
   MDSInternalContextWrapper(MDSRank *m, Context *c) : mds(m), fin(c) {}
-  void finish(int r);
 };
 
 class MDSIOContextBase : public MDSContext
 {
 public:
-  void complete(int r);
+  MDSIOContextBase(bool track=true);
+  virtual ~MDSIOContextBase();
+  MDSIOContextBase(const MDSIOContextBase&) = delete;
+  MDSIOContextBase& operator=(const MDSIOContextBase&) = delete;
+
+  void complete(int r) override;
+
+  virtual void print(ostream& out) const = 0;
+
+  static bool check_ios_in_flight(ceph::coarse_mono_time cutoff,
+				  std::string& slow_count,
+				  ceph::coarse_mono_time& oldest);
+private:
+  ceph::coarse_mono_time created_at;
+  elist<MDSIOContextBase*>::item list_item;
+
+  static elist<MDSIOContextBase*> ctx_list;
+  static ceph::spinlock ctx_list_lock;
 };
 
 /**
@@ -95,6 +126,9 @@ public:
   void complete(int r) final;
   void set_write_pos(uint64_t wp) { write_pos = wp; }
   virtual void pre_finish(int r) {}
+  void print(ostream& out) const override {
+    out << "log_event(" << write_pos << ")";
+  }
 };
 
 /**
@@ -105,11 +139,11 @@ class MDSIOContext : public MDSIOContextBase
 {
 protected:
   MDSRank *mds;
-  virtual MDSRank* get_mds();
+  MDSRank* get_mds() override;
 
 public:
   explicit MDSIOContext(MDSRank *mds_) : mds(mds_) {
-    assert(mds != NULL);
+    ceph_assert(mds != NULL);
   }
 };
 
@@ -122,21 +156,24 @@ class MDSIOContextWrapper : public MDSIOContextBase
 protected:
   MDSRank *mds;
   Context *fin;
-  MDSRank *get_mds();
+  MDSRank *get_mds() override;
 public:
   MDSIOContextWrapper(MDSRank *m, Context *c) : mds(m), fin(c) {}
-  void finish(int r);
+  void finish(int r) override;
+  void print(ostream& out) const override {
+    out << "io_context_wrapper(" << fin << ")";
+  }
 };
 
 /**
  * No-op for callers expecting MDSInternalContextBase
  */
-class C_MDSInternalNoop : public MDSInternalContextBase
+class C_MDSInternalNoop final : public MDSInternalContextBase
 {
-  virtual MDSRank* get_mds() {ceph_abort();}
+  MDSRank* get_mds() override {ceph_abort();}
 public:
-  void finish(int r) {}
-  void complete(int r) {}
+  void finish(int r) override {}
+  void complete(int r) override { delete this; }
 };
 
 
@@ -149,23 +186,26 @@ class C_IO_Wrapper : public MDSIOContext
 protected:
   bool async;
   MDSInternalContextBase *wrapped;
-  virtual void finish(int r) {
+  void finish(int r) override {
     wrapped->complete(r);
     wrapped = nullptr;
   }
 public:
   C_IO_Wrapper(MDSRank *mds_, MDSInternalContextBase *wrapped_) :
     MDSIOContext(mds_), async(true), wrapped(wrapped_) {
-    assert(wrapped != NULL);
+    ceph_assert(wrapped != NULL);
   }
 
-  ~C_IO_Wrapper() {
+  ~C_IO_Wrapper() override {
     if (wrapped != nullptr) {
       delete wrapped;
       wrapped = nullptr;
     }
   }
-  virtual void complete(int r) final;
+  void complete(int r) final;
+  void print(ostream& out) const override {
+    out << "io_wrapper(" << wrapped << ")";
+  }
 };
 
 
@@ -175,7 +215,7 @@ public:
 class MDSInternalContextGather : public MDSInternalContextBase
 {
 protected:
-  MDSRank *get_mds();
+  MDSRank *get_mds() override;
 };
 
 
@@ -184,10 +224,12 @@ class MDSGather : public C_GatherBase<MDSInternalContextBase, MDSInternalContext
 public:
   MDSGather(CephContext *cct, MDSInternalContextBase *onfinish) : C_GatherBase<MDSInternalContextBase, MDSInternalContextGather>(cct, onfinish) {}
 protected:
-  virtual MDSRank *get_mds() {return NULL;}
+  MDSRank *get_mds() override {return NULL;}
 };
 
 
 typedef C_GatherBuilderBase<MDSInternalContextBase, MDSGather> MDSGatherBuilder;
+
+using MDSContextFactory = ContextFactory<MDSInternalContextBase>;
 
 #endif  // MDS_CONTEXT_H

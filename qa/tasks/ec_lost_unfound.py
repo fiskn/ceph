@@ -34,7 +34,7 @@ def task(ctx, config):
     profile = config.get('erasure_code_profile', {
         'k': '2',
         'm': '2',
-        'ruleset-failure-domain': 'osd'
+        'crush-failure-domain': 'osd'
     })
     profile_name = profile.get('name', 'lost_unfound')
     manager.create_erasure_code_profile(profile_name, profile)
@@ -48,8 +48,7 @@ def task(ctx, config):
     # kludge to make sure they get a map
     rados(ctx, mon, ['-p', pool, 'put', 'dummy', dummyfile])
 
-    manager.raw_cluster_cmd('tell', 'osd.0', 'flush_pg_stats')
-    manager.raw_cluster_cmd('tell', 'osd.1', 'flush_pg_stats')
+    manager.flush_pg_stats([0, 1])
     manager.wait_for_recovery()
 
     # create old objects
@@ -84,13 +83,9 @@ def task(ctx, config):
     manager.revive_osd(3)
     manager.wait_till_osd_is_up(3)
 
-    manager.raw_cluster_cmd('tell', 'osd.0', 'flush_pg_stats')
-    manager.raw_cluster_cmd('tell', 'osd.2', 'flush_pg_stats')
-    manager.raw_cluster_cmd('tell', 'osd.3', 'flush_pg_stats')
+    manager.flush_pg_stats([0, 2, 3])
     manager.wait_till_active()
-    manager.raw_cluster_cmd('tell', 'osd.0', 'flush_pg_stats')
-    manager.raw_cluster_cmd('tell', 'osd.2', 'flush_pg_stats')
-    manager.raw_cluster_cmd('tell', 'osd.3', 'flush_pg_stats')
+    manager.flush_pg_stats([0, 2, 3])
 
     # verify that there are unfound objects
     unfound = manager.get_num_unfound_objects()
@@ -128,7 +123,7 @@ def task(ctx, config):
             # verify that i can list them direct from the osd
             log.info('listing missing/lost in %s state %s', pg['pgid'],
                      pg['state']);
-            m = manager.list_pg_missing(pg['pgid'])
+            m = manager.list_pg_unfound(pg['pgid'])
             log.info('%s' % m)
             assert m['num_unfound'] == pg['stat_sum']['num_objects_unfound']
 
@@ -141,9 +136,7 @@ def task(ctx, config):
     manager.raw_cluster_cmd('tell', 'osd.0', 'debug', 'kick_recovery_wq', '5')
     manager.raw_cluster_cmd('tell', 'osd.2', 'debug', 'kick_recovery_wq', '5')
     manager.raw_cluster_cmd('tell', 'osd.3', 'debug', 'kick_recovery_wq', '5')
-    manager.raw_cluster_cmd('tell', 'osd.0', 'flush_pg_stats')
-    manager.raw_cluster_cmd('tell', 'osd.2', 'flush_pg_stats')
-    manager.raw_cluster_cmd('tell', 'osd.3', 'flush_pg_stats')
+    manager.flush_pg_stats([0, 2, 3])
     manager.wait_for_recovery()
 
     if not config.get('parallel_bench', True):

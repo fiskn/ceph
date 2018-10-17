@@ -23,8 +23,6 @@
 #include "cls/rbd/cls_rbd_types.h"
 #include "cls/rbd/cls_rbd_client.h"
 #include "journal/Journaler.h"
-#include "librbd/AioCompletion.h"
-#include "librbd/AioImageRequestWQ.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/ImageState.h"
@@ -32,11 +30,15 @@
 #include "librbd/Operations.h"
 #include "librbd/Utils.h"
 #include "librbd/internal.h"
-#include "tools/rbd_mirror/types.h"
+#include "librbd/api/Mirror.h"
+#include "librbd/io/AioCompletion.h"
+#include "librbd/io/ImageRequestWQ.h"
+#include "librbd/io/ReadResult.h"
 #include "tools/rbd_mirror/ImageReplayer.h"
-#include "tools/rbd_mirror/ImageSyncThrottler.h"
+#include "tools/rbd_mirror/InstanceWatcher.h"
+#include "tools/rbd_mirror/ServiceDaemon.h"
 #include "tools/rbd_mirror/Threads.h"
-#include "tools/rbd_mirror/ImageDeleter.h"
+#include "tools/rbd_mirror/Types.h"
 
 #include "test/librados/test.h"
 #include "gtest/gtest.h"
@@ -62,8 +64,8 @@ public:
       : test(test), oid(oid), lock("C_WatchCtx::lock"), notified(false) {
     }
 
-    virtual void handle_notify(uint64_t notify_id, uint64_t cookie,
-                               uint64_t notifier_id, bufferlist& bl_) {
+    void handle_notify(uint64_t notify_id, uint64_t cookie,
+                               uint64_t notifier_id, bufferlist& bl_) override {
       bufferlist bl;
       test->m_remote_ioctx.notify_ack(oid, notify_id, cookie, bl);
 
@@ -72,7 +74,7 @@ public:
       cond.Signal();
     }
 
-    virtual void handle_error(uint64_t cookie, int err) {
+    void handle_error(uint64_t cookie, int err) override {
       ASSERT_EQ(0, err);
     }
   };
@@ -83,11 +85,13 @@ public:
     EXPECT_EQ("", connect_cluster_pp(*m_local_cluster.get()));
     EXPECT_EQ(0, m_local_cluster->conf_set("rbd_cache", "false"));
     EXPECT_EQ(0, m_local_cluster->conf_set("rbd_mirror_journal_poll_age", "1"));
-
+    EXPECT_EQ(0, m_local_cluster->conf_set("rbd_mirror_journal_commit_age",
+                                           "0.1"));
     m_local_pool_name = get_temp_pool_name();
     EXPECT_EQ(0, m_local_cluster->pool_create(m_local_pool_name.c_str()));
     EXPECT_EQ(0, m_local_cluster->ioctx_create(m_local_pool_name.c_str(),
 					      m_local_ioctx));
+    m_local_ioctx.application_enable("rbd", true);
 
     EXPECT_EQ("", connect_cluster_pp(m_remote_cluster));
     EXPECT_EQ(0, m_remote_cluster.conf_set("rbd_cache", "false"));
@@ -99,6 +103,10 @@ public:
 
     EXPECT_EQ(0, m_remote_cluster.ioctx_create(m_remote_pool_name.c_str(),
 					       m_remote_ioctx));
+    m_remote_ioctx.application_enable("rbd", true);
+
+    EXPECT_EQ(0, librbd::api::Mirror<>::mode_set(m_remote_ioctx,
+                                                 RBD_MIRROR_MODE_POOL));
 
     m_image_name = get_temp_image_name();
     uint64_t features = librbd::util::get_rbd_default_features(g_ceph_context);
@@ -107,22 +115,28 @@ public:
     EXPECT_EQ(0, librbd::create(m_remote_ioctx, m_image_name.c_str(), 1 << 22,
 				false, features, &order, 0, 0));
     m_remote_image_id = get_image_id(m_remote_ioctx, m_image_name);
+    m_global_image_id = get_global_image_id(m_remote_ioctx, m_remote_image_id);
 
-    m_threads = new rbd::mirror::Threads(reinterpret_cast<CephContext*>(
-      m_local_ioctx.cct()));
+    m_threads.reset(new rbd::mirror::Threads<>(reinterpret_cast<CephContext*>(
+      m_local_ioctx.cct())));
 
-    m_image_deleter.reset(new rbd::mirror::ImageDeleter(m_threads->work_queue,
-                                                        m_threads->timer,
-                                                        &m_threads->timer_lock));
-    m_image_sync_throttler.reset(new rbd::mirror::ImageSyncThrottler<>());
+    m_service_daemon.reset(new rbd::mirror::ServiceDaemon<>(g_ceph_context,
+                                                            m_local_cluster,
+                                                            m_threads.get()));
+
+    m_instance_watcher = rbd::mirror::InstanceWatcher<>::create(
+        m_local_ioctx, m_threads->work_queue, nullptr);
+    m_instance_watcher->handle_acquire_leader();
   }
 
-  ~TestImageReplayer()
+  ~TestImageReplayer() override
   {
     unwatch();
 
+    m_instance_watcher->handle_release_leader();
+
     delete m_replayer;
-    delete m_threads;
+    delete m_instance_watcher;
 
     EXPECT_EQ(0, m_remote_cluster.pool_delete(m_remote_pool_name.c_str()));
     EXPECT_EQ(0, m_local_cluster->pool_delete(m_local_pool_name.c_str()));
@@ -130,11 +144,11 @@ public:
 
   template <typename ImageReplayerT = rbd::mirror::ImageReplayer<> >
   void create_replayer() {
-    m_replayer = new ImageReplayerT(m_threads, m_image_deleter, m_image_sync_throttler,
-      rbd::mirror::RadosRef(new librados::Rados(m_local_ioctx)),
-      rbd::mirror::RadosRef(new librados::Rados(m_remote_ioctx)),
-      m_local_mirror_uuid, m_remote_mirror_uuid, m_local_ioctx.get_id(),
-      m_remote_pool_id, m_remote_image_id, "global image id");
+    m_replayer = new ImageReplayerT(
+        m_threads.get(), m_instance_watcher,
+        rbd::mirror::RadosRef(new librados::Rados(m_local_ioctx)),
+        m_local_mirror_uuid, m_local_ioctx.get_id(), m_global_image_id);
+    m_replayer->add_peer("peer uuid", m_remote_ioctx);
   }
 
   void start()
@@ -189,12 +203,20 @@ public:
     return id;
   }
 
+  std::string get_global_image_id(librados::IoCtx& io_ctx,
+                                  const std::string& image_id) {
+    cls::rbd::MirrorImage mirror_image;
+    EXPECT_EQ(0, librbd::cls_client::mirror_image_get(&io_ctx, image_id,
+                                                      &mirror_image));
+    return mirror_image.global_image_id;
+  }
+
   void open_image(librados::IoCtx &ioctx, const std::string &image_name,
 		  bool readonly, librbd::ImageCtx **ictxp)
   {
     librbd::ImageCtx *ictx = new librbd::ImageCtx(image_name.c_str(),
 						  "", "", ioctx, readonly);
-    EXPECT_EQ(0, ictx->state->open());
+    EXPECT_EQ(0, ictx->state->open(false));
     *ictxp = ictx;
   }
 
@@ -262,7 +284,7 @@ public:
 
     Mutex::Locker locker(m_watch_ctx->lock);
     while (!m_watch_ctx->notified) {
-      if (m_watch_ctx->cond.WaitInterval(g_ceph_context, m_watch_ctx->lock,
+      if (m_watch_ctx->cond.WaitInterval(m_watch_ctx->lock,
 					 utime_t(seconds, 0)) != 0) {
         return false;
       }
@@ -277,10 +299,6 @@ public:
     cls::journal::ObjectPosition mirror_position;
 
     for (int i = 0; i < 100; i++) {
-      printf("m_replayer->flush()\n");
-      C_SaferCond cond;
-      m_replayer->flush(&cond);
-      ASSERT_EQ(0, cond.wait());
       get_commit_positions(&master_position, &mirror_position);
       if (master_position == mirror_position) {
 	break;
@@ -305,7 +323,9 @@ public:
                        size_t len)
   {
     size_t written;
-    written = ictx->aio_work_queue->write(off, len, test_data, 0);
+    bufferlist bl;
+    bl.append(std::string(test_data, len));
+    written = ictx->io_work_queue->write(off, len, std::move(bl), 0);
     printf("wrote: %d\n", (int)written);
     ASSERT_EQ(len, written);
   }
@@ -317,7 +337,8 @@ public:
     char *result = (char *)malloc(len + 1);
 
     ASSERT_NE(static_cast<char *>(NULL), result);
-    read = ictx->aio_work_queue->read(off, len, result, 0);
+    read = ictx->io_work_queue->read(
+      off, len, librbd::io::ReadResult{result, len}, 0);
     printf("read: %d\n", (int)read);
     ASSERT_EQ(len, static_cast<size_t>(read));
     result[len] = '\0';
@@ -338,9 +359,9 @@ public:
   void flush(librbd::ImageCtx *ictx)
   {
     C_SaferCond aio_flush_ctx;
-    librbd::AioCompletion *c = librbd::AioCompletion::create(&aio_flush_ctx);
+    auto c = librbd::io::AioCompletion::create(&aio_flush_ctx);
     c->get();
-    ictx->aio_work_queue->aio_flush(c);
+    ictx->io_work_queue->aio_flush(c);
     ASSERT_EQ(0, c->wait_for_complete());
     c->put();
 
@@ -353,11 +374,11 @@ public:
 
   static int _image_number;
 
-  rbd::mirror::Threads *m_threads = nullptr;
-  std::shared_ptr<rbd::mirror::ImageDeleter> m_image_deleter;
   std::shared_ptr<librados::Rados> m_local_cluster;
+  std::unique_ptr<rbd::mirror::Threads<>> m_threads;
+  std::unique_ptr<rbd::mirror::ServiceDaemon<>> m_service_daemon;
   librados::Rados m_remote_cluster;
-  std::shared_ptr<rbd::mirror::ImageSyncThrottler<>> m_image_sync_throttler;
+  rbd::mirror::InstanceWatcher<> *m_instance_watcher;
   std::string m_local_mirror_uuid = "local mirror uuid";
   std::string m_remote_mirror_uuid = "remote mirror uuid";
   std::string m_local_pool_name, m_remote_pool_name;
@@ -365,10 +386,12 @@ public:
   std::string m_image_name;
   int64_t m_remote_pool_id;
   std::string m_remote_image_id;
+  std::string m_global_image_id;
   rbd::mirror::ImageReplayer<> *m_replayer;
   C_WatchCtx *m_watch_ctx;
   uint64_t m_watch_handle;
   char m_test_data[TEST_IO_SIZE + 1];
+  std::string m_journal_commit_age;
 };
 
 int TestImageReplayer::_image_number;
@@ -392,19 +415,66 @@ TEST_F(TestImageReplayer, BootstrapErrorLocalImageExists)
 
 TEST_F(TestImageReplayer, BootstrapErrorNoJournal)
 {
-  // disable remote journal journaling
+  ASSERT_EQ(0, librbd::Journal<>::remove(m_remote_ioctx, m_remote_image_id));
+
+  create_replayer<>();
+  C_SaferCond cond;
+  m_replayer->start(&cond);
+  ASSERT_EQ(-ENOENT, cond.wait());
+}
+
+TEST_F(TestImageReplayer, BootstrapErrorMirrorDisabled)
+{
+  // disable remote image mirroring
+  ASSERT_EQ(0, librbd::api::Mirror<>::mode_set(m_remote_ioctx,
+                                               RBD_MIRROR_MODE_IMAGE));
   librbd::ImageCtx *ictx;
   open_remote_image(&ictx);
-  uint64_t features;
-  ASSERT_EQ(0, librbd::get_features(ictx, &features));
-  ASSERT_EQ(0, ictx->operations->update_features(RBD_FEATURE_JOURNALING,
-                                                 false));
+  ASSERT_EQ(0, librbd::api::Mirror<>::image_disable(ictx, true));
   close_image(ictx);
 
   create_replayer<>();
   C_SaferCond cond;
   m_replayer->start(&cond);
   ASSERT_EQ(-ENOENT, cond.wait());
+}
+
+TEST_F(TestImageReplayer, BootstrapMirrorDisabling)
+{
+  // set remote image mirroring state to DISABLING
+  ASSERT_EQ(0, librbd::api::Mirror<>::mode_set(m_remote_ioctx,
+                                               RBD_MIRROR_MODE_IMAGE));
+  librbd::ImageCtx *ictx;
+  open_remote_image(&ictx);
+  ASSERT_EQ(0, librbd::api::Mirror<>::image_enable(ictx, false));
+  cls::rbd::MirrorImage mirror_image;
+  ASSERT_EQ(0, librbd::cls_client::mirror_image_get(&m_remote_ioctx, ictx->id,
+                                                    &mirror_image));
+  mirror_image.state = cls::rbd::MirrorImageState::MIRROR_IMAGE_STATE_DISABLING;
+  ASSERT_EQ(0, librbd::cls_client::mirror_image_set(&m_remote_ioctx, ictx->id,
+                                                    mirror_image));
+  close_image(ictx);
+
+  create_replayer<>();
+  C_SaferCond cond;
+  m_replayer->start(&cond);
+  ASSERT_EQ(-EREMOTEIO, cond.wait());
+  ASSERT_TRUE(m_replayer->is_stopped());
+}
+
+TEST_F(TestImageReplayer, BootstrapDemoted)
+{
+  // demote remote image
+  librbd::ImageCtx *ictx;
+  open_remote_image(&ictx);
+  ASSERT_EQ(0, librbd::api::Mirror<>::image_demote(ictx));
+  close_image(ictx);
+
+  create_replayer<>();
+  C_SaferCond cond;
+  m_replayer->start(&cond);
+  ASSERT_EQ(-EREMOTEIO, cond.wait());
+  ASSERT_TRUE(m_replayer->is_stopped());
 }
 
 TEST_F(TestImageReplayer, StartInterrupted)
@@ -423,7 +493,10 @@ TEST_F(TestImageReplayer, StartInterrupted)
 TEST_F(TestImageReplayer, JournalReset)
 {
   bootstrap();
+  delete m_replayer;
+
   ASSERT_EQ(0, librbd::Journal<>::reset(m_remote_ioctx, m_remote_image_id));
+
   // try to recover
   bootstrap();
 }
@@ -445,7 +518,7 @@ TEST_F(TestImageReplayer, ErrorNoJournal)
 
   C_SaferCond cond;
   m_replayer->start(&cond);
-  ASSERT_EQ(-ENOENT, cond.wait());
+  ASSERT_EQ(0, cond.wait());
 }
 
 TEST_F(TestImageReplayer, StartStop)
@@ -561,8 +634,6 @@ TEST_F(TestImageReplayer, Resync)
 
   start();
 
-  std::string image_id = m_replayer->get_local_image_id();
-
   generate_test_data();
 
   open_remote_image(&ictx);
@@ -583,18 +654,13 @@ TEST_F(TestImageReplayer, Resync)
   m_replayer->resync_image(&ctx);
   ASSERT_EQ(0, ctx.wait());
 
-  C_SaferCond delete_ctx;
-  m_image_deleter->wait_for_scheduled_deletion(
-    m_local_ioctx.get_id(), m_replayer->get_global_image_id(), &delete_ctx);
-  EXPECT_EQ(0, delete_ctx.wait());
+  wait_for_stopped();
 
   C_SaferCond cond;
   m_replayer->start(&cond);
   ASSERT_EQ(0, cond.wait());
 
-  ASSERT_NE(image_id, m_replayer->get_local_image_id());
   ASSERT_TRUE(m_replayer->is_replaying());
-
   wait_for_replay_complete();
 
   open_local_image(&ictx);
@@ -612,8 +678,6 @@ TEST_F(TestImageReplayer, Resync_While_Stop)
   bootstrap();
 
   start();
-
-  std::string image_id = m_replayer->get_local_image_id();
 
   generate_test_data();
 
@@ -648,16 +712,10 @@ TEST_F(TestImageReplayer, Resync_While_Stop)
 
   ASSERT_TRUE(m_replayer->is_stopped());
 
-  C_SaferCond delete_ctx;
-  m_image_deleter->wait_for_scheduled_deletion(
-    m_local_ioctx.get_id(), m_replayer->get_global_image_id(), &delete_ctx);
-  EXPECT_EQ(0, delete_ctx.wait());
-
   C_SaferCond cond3;
   m_replayer->start(&cond3);
   ASSERT_EQ(0, cond3.wait());
 
-  ASSERT_NE(image_id, m_replayer->get_local_image_id());
   ASSERT_TRUE(m_replayer->is_replaying());
 
   wait_for_replay_complete();
@@ -676,8 +734,6 @@ TEST_F(TestImageReplayer, Resync_StartInterrupted)
 
   bootstrap();
 
-  std::string image_id = m_replayer->get_local_image_id();
-
   librbd::ImageCtx *ictx;
   open_local_image(&ictx);
   librbd::Journal<>::request_resync(ictx);
@@ -689,11 +745,6 @@ TEST_F(TestImageReplayer, Resync_StartInterrupted)
 
   ASSERT_TRUE(m_replayer->is_stopped());
 
-  C_SaferCond delete_ctx;
-  m_image_deleter->wait_for_scheduled_deletion(
-    m_local_ioctx.get_id(), m_replayer->get_global_image_id(), &delete_ctx);
-  EXPECT_EQ(0, delete_ctx.wait());
-
   C_SaferCond cond2;
   m_replayer->start(&cond2);
   ASSERT_EQ(0, cond2.wait());
@@ -703,10 +754,9 @@ TEST_F(TestImageReplayer, Resync_StartInterrupted)
   m_watch_ctx = new C_WatchCtx(this, oid);
   ASSERT_EQ(0, m_remote_ioctx.watch2(oid, &m_watch_handle, m_watch_ctx));
 
-  ASSERT_NE(image_id, m_replayer->get_local_image_id());
-
   ASSERT_TRUE(m_replayer->is_replaying());
 
+  generate_test_data();
   open_remote_image(&ictx);
   for (int i = 0; i < TEST_IO_COUNT; ++i) {
     write_test_data(ictx, m_test_data, TEST_IO_SIZE * i, TEST_IO_SIZE);
@@ -739,12 +789,14 @@ TEST_F(TestImageReplayer, MultipleReplayFailures_SingleEpoch) {
   librbd::ImageCtx *ictx;
   open_image(m_local_ioctx, m_image_name, false, &ictx);
   ictx->features &= ~RBD_FEATURE_JOURNALING;
-  ASSERT_EQ(0, ictx->operations->snap_create("foo",
-					     cls::rbd::UserSnapshotNamespace()));
-  ASSERT_EQ(0, ictx->operations->snap_protect("foo"));
+  ASSERT_EQ(0, ictx->operations->snap_create(cls::rbd::UserSnapshotNamespace(),
+					     "foo"));
+  ASSERT_EQ(0, ictx->operations->snap_protect(cls::rbd::UserSnapshotNamespace(),
+					      "foo"));
   ASSERT_EQ(0, librbd::cls_client::add_child(&ictx->md_ctx, RBD_CHILDREN,
-                                             {ictx->md_ctx.get_id(),
-                                              ictx->id, ictx->snap_ids["foo"]},
+                                             {ictx->md_ctx.get_id(), "",
+                                              ictx->id,
+					      ictx->snap_ids[{cls::rbd::UserSnapshotNamespace(), "foo"}]},
                                              "dummy child id"));
   close_image(ictx);
 
@@ -753,14 +805,16 @@ TEST_F(TestImageReplayer, MultipleReplayFailures_SingleEpoch) {
   for (uint64_t i = 0; i < 10; ++i) {
     RWLock::RLocker owner_locker(ictx->owner_lock);
     C_SaferCond request_lock;
-    ictx->exclusive_lock->request_lock(&request_lock);
+    ictx->exclusive_lock->acquire_lock(&request_lock);
     ASSERT_EQ(0, request_lock.wait());
 
     C_SaferCond append_ctx;
     ictx->journal->append_op_event(
       i,
       librbd::journal::EventEntry{
-        librbd::journal::SnapUnprotectEvent{i, "foo"}},
+        librbd::journal::SnapUnprotectEvent{i,
+					    cls::rbd::UserSnapshotNamespace(),
+					    "foo"}},
       &append_ctx);
     ASSERT_EQ(0, append_ctx.wait());
 
@@ -778,6 +832,7 @@ TEST_F(TestImageReplayer, MultipleReplayFailures_SingleEpoch) {
     wait_for_stopped();
     unwatch();
   }
+  close_image(ictx);
 }
 
 TEST_F(TestImageReplayer, MultipleReplayFailures_MultiEpoch) {
@@ -787,12 +842,15 @@ TEST_F(TestImageReplayer, MultipleReplayFailures_MultiEpoch) {
   librbd::ImageCtx *ictx;
   open_image(m_local_ioctx, m_image_name, false, &ictx);
   ictx->features &= ~RBD_FEATURE_JOURNALING;
-  ASSERT_EQ(0, ictx->operations->snap_create("foo",
-					     cls::rbd::UserSnapshotNamespace()));
-  ASSERT_EQ(0, ictx->operations->snap_protect("foo"));
+  ASSERT_EQ(0, ictx->operations->snap_create(cls::rbd::UserSnapshotNamespace(),
+					     "foo"));
+  ASSERT_EQ(0, ictx->operations->snap_protect(cls::rbd::UserSnapshotNamespace(),
+					      "foo"));
   ASSERT_EQ(0, librbd::cls_client::add_child(&ictx->md_ctx, RBD_CHILDREN,
-                                             {ictx->md_ctx.get_id(),
-                                              ictx->id, ictx->snap_ids["foo"]},
+                                             {ictx->md_ctx.get_id(), "",
+                                              ictx->id,
+					      ictx->snap_ids[{cls::rbd::UserSnapshotNamespace(),
+							      "foo"}]},
                                              "dummy child id"));
   close_image(ictx);
 
@@ -801,14 +859,16 @@ TEST_F(TestImageReplayer, MultipleReplayFailures_MultiEpoch) {
   {
     RWLock::RLocker owner_locker(ictx->owner_lock);
     C_SaferCond request_lock;
-    ictx->exclusive_lock->request_lock(&request_lock);
+    ictx->exclusive_lock->acquire_lock(&request_lock);
     ASSERT_EQ(0, request_lock.wait());
 
     C_SaferCond append_ctx;
     ictx->journal->append_op_event(
       1U,
       librbd::journal::EventEntry{
-        librbd::journal::SnapUnprotectEvent{1U, "foo"}},
+        librbd::journal::SnapUnprotectEvent{1U,
+					    cls::rbd::UserSnapshotNamespace(),
+					    "foo"}},
       &append_ctx);
     ASSERT_EQ(0, append_ctx.wait());
 
@@ -821,6 +881,7 @@ TEST_F(TestImageReplayer, MultipleReplayFailures_MultiEpoch) {
     ASSERT_EQ(0, release_ctx.wait());
   }
 
+  generate_test_data();
   write_test_data(ictx, m_test_data, 0, TEST_IO_SIZE);
 
   for (uint64_t i = 0; i < 5; ++i) {
@@ -865,11 +926,7 @@ TEST_F(TestImageReplayer, Disconnect)
   close_image(ictx);
   C_SaferCond cond2;
   m_replayer->start(&cond2);
-  ASSERT_EQ(-ENOTCONN, cond2.wait());
-  C_SaferCond delete_cond;
-  m_image_deleter->wait_for_scheduled_deletion(
-    m_local_ioctx.get_id(), m_replayer->get_global_image_id(), &delete_cond);
-  EXPECT_EQ(0, delete_cond.wait());
+  ASSERT_EQ(0, cond2.wait());
 
   start();
   wait_for_replay_complete();
@@ -907,10 +964,6 @@ TEST_F(TestImageReplayer, Disconnect)
   C_SaferCond cond5;
   m_replayer->start(&cond5);
   ASSERT_EQ(-ENOTCONN, cond5.wait());
-  C_SaferCond delete_cond1;
-  m_image_deleter->wait_for_scheduled_deletion(
-    m_local_ioctx.get_id(), m_replayer->get_global_image_id(), &delete_cond1);
-  EXPECT_EQ(0, delete_cond1.wait());
 
   C_SaferCond cond6;
   m_replayer->start(&cond6);
@@ -1051,6 +1104,59 @@ TEST_F(TestImageReplayer, MetadataSetRemove)
   open_local_image(&ictx);
   ASSERT_EQ(-ENOENT, librbd::metadata_get(ictx, KEY, &value));
   close_image(ictx);
+
+  stop();
+}
+
+TEST_F(TestImageReplayer, MirroringDelay)
+{
+  const double DELAY = 10; // set less than wait_for_replay_complete timeout
+
+  librbd::ImageCtx *ictx;
+  utime_t start_time;
+  double delay;
+
+  bootstrap();
+
+  ASSERT_EQ(0, m_local_cluster->conf_set("rbd_mirroring_replay_delay",
+                                         stringify(DELAY).c_str()));
+  open_local_image(&ictx);
+  ASSERT_EQ(DELAY, ictx->mirroring_replay_delay);
+  close_image(ictx);
+
+  start();
+
+  // Test delay
+
+  generate_test_data();
+  open_remote_image(&ictx);
+  start_time = ceph_clock_now();
+  for (int i = 0; i < TEST_IO_COUNT; ++i) {
+    write_test_data(ictx, m_test_data, TEST_IO_SIZE * i, TEST_IO_SIZE);
+  }
+  flush(ictx);
+  close_image(ictx);
+
+  wait_for_replay_complete();
+  delay = ceph_clock_now() - start_time;
+  ASSERT_GE(delay, DELAY);
+
+  // Test stop when delaying replay
+
+  open_remote_image(&ictx);
+  start_time = ceph_clock_now();
+  for (int i = 0; i < TEST_IO_COUNT; ++i) {
+    write_test_data(ictx, m_test_data, TEST_IO_SIZE * i, TEST_IO_SIZE);
+  }
+  close_image(ictx);
+
+  sleep(DELAY / 2);
+  stop();
+  start();
+
+  wait_for_replay_complete();
+  delay = ceph_clock_now() - start_time;
+  ASSERT_GE(delay, DELAY);
 
   stop();
 }

@@ -29,25 +29,24 @@ public:
 
   EUpdate() : LogEvent(EVENT_UPDATE), cmapv(0), had_slaves(false) { }
   EUpdate(MDLog *mdlog, const char *s) : 
-    LogEvent(EVENT_UPDATE), metablob(mdlog),
+    LogEvent(EVENT_UPDATE),
     type(s), cmapv(0), had_slaves(false) { }
   
-  void print(ostream& out) const {
+  void print(ostream& out) const override {
     if (type.length())
       out << "EUpdate " << type << " ";
     out << metablob;
   }
 
-  EMetaBlob *get_metablob() { return &metablob; }
+  EMetaBlob *get_metablob() override { return &metablob; }
 
-  void encode(bufferlist& bl, uint64_t features) const;
-  void decode(bufferlist::iterator& bl);
-  void dump(Formatter *f) const;
+  void encode(bufferlist& bl, uint64_t features) const override;
+  void decode(bufferlist::const_iterator& bl) override;
+  void dump(Formatter *f) const override;
   static void generate_test_instances(list<EUpdate*>& ls);
 
-  void update_segment();
-  void replay(MDSRank *mds);
-  EMetaBlob const *get_metablob() const {return &metablob;}
+  void update_segment() override;
+  void replay(MDSRank *mds) override;
 };
 WRITE_CLASS_ENCODER_FEATURES(EUpdate)
 

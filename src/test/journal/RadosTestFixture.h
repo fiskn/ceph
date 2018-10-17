@@ -18,8 +18,8 @@ public:
   static std::string get_temp_oid();
 
   RadosTestFixture();
-  virtual void SetUp();
-  virtual void TearDown();
+  void SetUp() override;
+  void TearDown() override;
 
   int create(const std::string &oid, uint8_t order = 14,
              uint8_t splay_width = 2);
@@ -46,7 +46,7 @@ public:
     Listener(RadosTestFixture *_test_fixture)
       : test_fixture(_test_fixture), mutex("mutex") {}
 
-    virtual void handle_update(journal::JournalMetadata *metadata) {
+    void handle_update(journal::JournalMetadata *metadata) override {
       Mutex::Locker locker(mutex);
       ++updates[metadata];
       cond.Signal();
@@ -64,7 +64,7 @@ public:
 
   librados::IoCtx m_ioctx;
 
-  ContextWQ *m_work_queue;
+  ContextWQ *m_work_queue = nullptr;
 
   Mutex m_timer_lock;
   SafeTimer *m_timer;

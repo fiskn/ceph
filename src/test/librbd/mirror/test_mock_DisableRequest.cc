@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #include "test/librbd/test_mock_fixture.h"
@@ -17,7 +17,7 @@ namespace librbd {
 namespace {
 
 struct MockTestImageCtx : public MockImageCtx {
-  MockTestImageCtx(librbd::ImageCtx& image_ctx) : MockImageCtx(image_ctx) {
+  explicit MockTestImageCtx(librbd::ImageCtx& image_ctx) : MockImageCtx(image_ctx) {
   }
 };
 
@@ -28,7 +28,7 @@ struct Journal<librbd::MockTestImageCtx> {
   static Journal *s_instance;
   static void is_tag_owner(librbd::MockTestImageCtx *, bool *is_primary,
                            Context *on_finish) {
-    assert(s_instance != nullptr);
+    ceph_assert(s_instance != nullptr);
     s_instance->is_tag_owner(is_primary, on_finish);
   }
 
@@ -49,7 +49,7 @@ struct MirroringWatcher<librbd::MockTestImageCtx> {
                                    const std::string &image_id,
                                    const std::string &global_image_id,
                                    Context *on_finish) {
-    assert(s_instance != nullptr);
+    ceph_assert(s_instance != nullptr);
     s_instance->notify_image_updated(mirror_image_state, image_id,
                                      global_image_id, on_finish);
   }
@@ -74,7 +74,7 @@ struct PromoteRequest<librbd::MockTestImageCtx> {
   static PromoteRequest *s_instance;
   static PromoteRequest *create(librbd::MockTestImageCtx *, bool force,
                                 Context *on_finish) {
-    assert(s_instance != nullptr);
+    ceph_assert(s_instance != nullptr);
     s_instance->on_finish = on_finish;
     return s_instance;
   }
@@ -117,8 +117,9 @@ public:
   void expect_get_mirror_image(MockTestImageCtx &mock_image_ctx,
                                const cls::rbd::MirrorImage &mirror_image,
                                int r) {
+    using ceph::encode;
     bufferlist bl;
-    ::encode(mirror_image, bl);
+    encode(mirror_image, bl);
 
     EXPECT_CALL(get_mock_io_ctx(mock_image_ctx.md_ctx),
                 exec(RBD_MIRRORING, _, StrEq("rbd"), StrEq("mirror_image_get"),
@@ -162,7 +163,8 @@ public:
                                   const std::set<cls::journal::Client> &clients,
                                   int r) {
     bufferlist bl;
-    ::encode(clients, bl);
+    using ceph::encode;
+    encode(clients, bl);
 
     EXPECT_CALL(get_mock_io_ctx(mock_image_ctx.md_ctx),
                 exec(::journal::Journaler::header_oid(mock_image_ctx.id),
@@ -175,7 +177,8 @@ public:
                                         const std::string &client_id,
                                         int r) {
     bufferlist bl;
-    ::encode(client_id, bl);
+    using ceph::encode;
+    encode(client_id, bl);
 
     EXPECT_CALL(get_mock_io_ctx(mock_image_ctx.md_ctx),
                 exec(::journal::Journaler::header_oid(mock_image_ctx.id),
@@ -192,14 +195,15 @@ public:
 
   void expect_snap_remove(MockTestImageCtx &mock_image_ctx,
                           const std::string &snap_name, int r) {
-    EXPECT_CALL(*mock_image_ctx.operations, execute_snap_remove(StrEq(snap_name), _))
-      .WillOnce(WithArg<1>(CompleteContext(r, mock_image_ctx.image_ctx->op_work_queue)));
+    EXPECT_CALL(*mock_image_ctx.operations, snap_remove(_, StrEq(snap_name), _))
+      .WillOnce(WithArg<2>(CompleteContext(r, mock_image_ctx.image_ctx->op_work_queue)));
   }
 
   template <typename T>
   bufferlist encode(const T &t) {
+    using ceph::encode;
     bufferlist bl;
-    ::encode(t, bl);
+    encode(t, bl);
     return bl;
   }
 
@@ -233,8 +237,8 @@ TEST_F(TestMockMirrorDisableRequest, Success) {
       {"", encode(journal::ClientData{journal::ImageClientMeta{}})},
       {"peer 1", encode(journal::ClientData{journal::MirrorPeerClientMeta{}})},
       {"peer 2", encode(journal::ClientData{journal::MirrorPeerClientMeta{
-        "remote image id", {{"snap 1", boost::optional<uint64_t>(0)},
-                            {"snap 2", boost::optional<uint64_t>(0)}}}
+        "remote image id", {{cls::rbd::UserSnapshotNamespace(), "snap 1", boost::optional<uint64_t>(0)},
+                            {cls::rbd::UserSnapshotNamespace(), "snap 2", boost::optional<uint64_t>(0)}}}
       })}
     }, 0);
   expect_journal_client_unregister(mock_image_ctx, "peer 1", 0);
@@ -493,8 +497,8 @@ TEST_F(TestMockMirrorDisableRequest, SnapRemoveError) {
       {"", encode(journal::ClientData{journal::ImageClientMeta{}})},
       {"peer 1", encode(journal::ClientData{journal::MirrorPeerClientMeta{}})},
       {"peer 2", encode(journal::ClientData{journal::MirrorPeerClientMeta{
-        "remote image id", {{"snap 1", boost::optional<uint64_t>(0)},
-                            {"snap 2", boost::optional<uint64_t>(0)}}}
+        "remote image id", {{cls::rbd::UserSnapshotNamespace(), "snap 1", boost::optional<uint64_t>(0)},
+                            {cls::rbd::UserSnapshotNamespace(), "snap 2", boost::optional<uint64_t>(0)}}}
       })}
     }, 0);
   expect_journal_client_unregister(mock_image_ctx, "peer 1", 0);
@@ -533,8 +537,8 @@ TEST_F(TestMockMirrorDisableRequest, JournalClientUnregisterError) {
       {"", encode(journal::ClientData{journal::ImageClientMeta{}})},
       {"peer 1", encode(journal::ClientData{journal::MirrorPeerClientMeta{}})},
       {"peer 2", encode(journal::ClientData{journal::MirrorPeerClientMeta{
-        "remote image id", {{"snap 1", boost::optional<uint64_t>(0)},
-                            {"snap 2", boost::optional<uint64_t>(0)}}}
+        "remote image id", {{cls::rbd::UserSnapshotNamespace(), "snap 1", boost::optional<uint64_t>(0)},
+                            {cls::rbd::UserSnapshotNamespace(), "snap 2", boost::optional<uint64_t>(0)}}}
       })}
     }, 0);
   expect_journal_client_unregister(mock_image_ctx, "peer 1", -EINVAL);

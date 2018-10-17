@@ -12,35 +12,13 @@
  * 
  */
 
-
-
-#include "include/types.h"
+#include "common/LogClient.h"
 #include "include/str_map.h"
-#include "include/uuid.h"
-
-#include "msg/Messenger.h"
-#include "msg/Message.h"
-
 #include "messages/MLog.h"
 #include "messages/MLogAck.h"
+#include "msg/Messenger.h"
 #include "mon/MonMap.h"
-
-#include <iostream>
-#include <errno.h>
-#include <sys/stat.h>
-#include <syslog.h>
-
-#ifdef DARWIN
-#include <sys/param.h>
-#include <sys/mount.h>
-#endif // DARWIN
-
 #include "common/Graylog.h"
-// wipe the assert() introduced by boost headers included by Graylog.h
-#include "include/assert.h"
-#include "common/LogClient.h"
-
-#include "common/config.h"
 
 #define dout_subsys ceph_subsys_monc
 
@@ -106,7 +84,7 @@ int parse_log_client_options(CephContext *cct,
     return r;
   }
 
-  fsid = cct->_conf->fsid;
+  fsid = cct->_conf.get_val<uuid_d>("fsid");
   host = cct->_conf->host;
   return 0;
 }
@@ -197,7 +175,7 @@ void LogChannel::update_config(map<string,string> &log_to_monitors,
   set_log_prio(prio);
 
   if (to_graylog && !graylog) { /* should but isn't */
-    graylog = ceph::logging::Graylog::Ref(new ceph::logging::Graylog("clog"));
+    graylog = std::make_shared<ceph::logging::Graylog>("clog");
   } else if (!to_graylog && graylog) { /* shouldn't but is */
     graylog.reset();
   }
@@ -234,17 +212,28 @@ void LogChannel::do_log(clog_type prio, std::stringstream& ss)
 
 void LogChannel::do_log(clog_type prio, const std::string& s)
 {
-  Mutex::Locker l(channel_lock);
-  int lvl = (prio == CLOG_ERROR ? -1 : 0);
-  ldout(cct,lvl) << "log " << prio << " : " << s << dendl;
+  std::lock_guard<Mutex> l(channel_lock);
+  if (CLOG_ERROR == prio) {
+    ldout(cct,-1) << "log " << prio << " : " << s << dendl;
+  } else {
+    ldout(cct,0) << "log " << prio << " : " << s << dendl;
+  }
   LogEntry e;
-  e.stamp = ceph_clock_now(cct);
+  e.stamp = ceph_clock_now();
   // seq and who should be set for syslog/graylog/log_to_mon
-  e.who = parent->get_myinst();
-  e.seq = parent->get_next_seq();
+  e.addrs = parent->get_myaddrs();
+  e.name = parent->get_myname();
+  e.rank = parent->get_myrank();
   e.prio = prio;
   e.msg = s;
   e.channel = get_log_channel();
+
+  // log to monitor?
+  if (log_to_monitors) {
+    e.seq = parent->queue(e);
+  } else {
+    e.seq = parent->get_next_seq();
+  }
 
   // log to syslog?
   if (do_log_to_syslog()) {
@@ -257,36 +246,31 @@ void LogChannel::do_log(clog_type prio, const std::string& s)
     ldout(cct,0) << __func__ << " log to graylog"  << dendl;
     graylog->log_log_entry(&e);
   }
+}
 
-  // log to monitor?
-  if (log_to_monitors) {
-    parent->queue(e);
+Message *LogClient::get_mon_log_message(bool flush)
+{
+  std::lock_guard<Mutex> l(log_lock);
+  if (flush) {
+    if (log_queue.empty())
+      return nullptr;
+    // reset session
+    last_log_sent = log_queue.front().seq;
   }
-}
-
-void LogClient::reset_session()
-{
-  Mutex::Locker l(log_lock);
-  last_log_sent = last_log - log_queue.size();
-}
-
-Message *LogClient::get_mon_log_message()
-{
-  Mutex::Locker l(log_lock);
   return _get_mon_log_message();
 }
 
 bool LogClient::are_pending()
 {
-  Mutex::Locker l(log_lock);
+  std::lock_guard<Mutex> l(log_lock);
   return last_log > last_log_sent;
 }
 
 Message *LogClient::_get_mon_log_message()
 {
-  assert(log_lock.is_locked());
-   if (log_queue.empty())
-     return NULL;
+  ceph_assert(log_lock.is_locked());
+  if (log_queue.empty())
+    return NULL;
 
   // only send entries that haven't been sent yet during this mon
   // session!  monclient needs to call reset_session() on mon session
@@ -299,7 +283,7 @@ Message *LogClient::_get_mon_log_message()
   unsigned num_unsent = last_log - last_log_sent;
   unsigned num_send;
   if (cct->_conf->mon_client_max_log_entries_per_message > 0)
-    num_send = MIN(num_unsent, (unsigned)cct->_conf->mon_client_max_log_entries_per_message);
+    num_send = std::min(num_unsent, (unsigned)cct->_conf->mon_client_max_log_entries_per_message);
   else
     num_send = num_unsent;
 
@@ -307,15 +291,15 @@ Message *LogClient::_get_mon_log_message()
 		<< " num " << log_queue.size()
 		<< " unsent " << num_unsent
 		<< " sending " << num_send << dendl;
-  assert(num_unsent <= log_queue.size());
+  ceph_assert(num_unsent <= log_queue.size());
   std::deque<LogEntry>::iterator p = log_queue.begin();
   std::deque<LogEntry> o;
   while (p->seq <= last_log_sent) {
     ++p;
-    assert(p != log_queue.end());
+    ceph_assert(p != log_queue.end());
   }
   while (num_send--) {
-    assert(p != log_queue.end());
+    ceph_assert(p != log_queue.end());
     o.push_back(*p);
     last_log_sent = p->seq;
     ldout(cct,10) << " will send " << *p << dendl;
@@ -330,17 +314,18 @@ Message *LogClient::_get_mon_log_message()
 
 void LogClient::_send_to_mon()
 {
-  assert(log_lock.is_locked());
-  assert(is_mon);
-  assert(messenger->get_myname().is_mon());
-  ldout(cct,10) << __func__ << "log to self" << dendl;
+  ceph_assert(log_lock.is_locked());
+  ceph_assert(is_mon);
+  ceph_assert(messenger->get_myname().is_mon());
+  ldout(cct,10) << __func__ << " log to self" << dendl;
   Message *log = _get_mon_log_message();
   messenger->get_loopback_connection()->send_message(log);
 }
 
 version_t LogClient::queue(LogEntry &entry)
 {
-  Mutex::Locker l(log_lock);
+  std::lock_guard<Mutex> l(log_lock);
+  entry.seq = ++last_log;
   log_queue.push_back(entry);
 
   if (is_mon) {
@@ -352,17 +337,28 @@ version_t LogClient::queue(LogEntry &entry)
 
 uint64_t LogClient::get_next_seq()
 {
+  std::lock_guard<Mutex> l(log_lock);
   return ++last_log;
 }
 
-const entity_inst_t& LogClient::get_myinst()
+entity_addrvec_t LogClient::get_myaddrs()
 {
-  return messenger->get_myinst();
+  return messenger->get_myaddrs();
+}
+
+entity_name_t LogClient::get_myrank()
+{
+  return messenger->get_myname();
+}
+
+const EntityName& LogClient::get_myname()
+{
+  return cct->_conf->name;
 }
 
 bool LogClient::handle_log_ack(MLogAck *m)
 {
-  Mutex::Locker l(log_lock);
+  std::lock_guard<Mutex> l(log_lock);
   ldout(cct,10) << "handle_log_ack " << *m << dendl;
 
   version_t last = m->last;

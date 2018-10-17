@@ -19,8 +19,9 @@ namespace image {
 template <typename ImageCtxT = ImageCtx>
 class OpenRequest {
 public:
-  static OpenRequest *create(ImageCtxT *image_ctx, Context *on_finish) {
-    return new OpenRequest(image_ctx, on_finish);
+  static OpenRequest *create(ImageCtxT *image_ctx, uint64_t flags,
+                             Context *on_finish) {
+    return new OpenRequest(image_ctx, flags, on_finish);
   }
 
   void send();
@@ -41,21 +42,30 @@ private:
    *                v                               |
    *            V2_GET_ID|NAME                      |
    *                |                               |
-   *                v                               |
-   *            V2_GET_IMMUTABLE_METADATA           |
+   *                v (skip if have name)           |
+   *            V2_GET_NAME_FROM_TRASH              |
    *                |                               |
    *                v                               |
-   *            V2_GET_STRIPE_UNIT_COUNT            |
+   *            V2_GET_INITIAL_METADATA             |
    *                |                               |
    *                v                               |
-   *            V2_GET_DATA_POOL                    |
+   *            V2_GET_STRIPE_UNIT_COUNT (skip if   |
+   *                |                     disabled) |
+   *                v                               |
+   *            V2_GET_CREATE_TIMESTAMP             |
    *                |                               |
    *                v                               |
-   *      /---> V2_APPLY_METADATA -------------> REGISTER_WATCH (skip if
-   *      |         |                               |            read-only)
-   *      \---------/                               v
-   *                                             REFRESH
+   *            V2_GET_ACCESS_MODIFIY_TIMESTAMP     |
+   *                |                               |
+   *                v                               |
+   *            V2_GET_DATA_POOL --------------> REFRESH
    *                                                |
+   *                                                v
+   *                                             INIT_CACHE
+   *                                                |
+   *                                                v
+   *                                             REGISTER_WATCH (skip if
+   *                                                |            read-only)
    *                                                v
    *                                             SET_SNAP (skip if no snap)
    *                                                |
@@ -68,16 +78,14 @@ private:
    * @endverbatim
    */
 
-  OpenRequest(ImageCtxT *image_ctx, Context *on_finish);
+  OpenRequest(ImageCtxT *image_ctx, uint64_t flags, Context *on_finish);
 
   ImageCtxT *m_image_ctx;
+  bool m_skip_open_parent_image;
   Context *m_on_finish;
 
   bufferlist m_out_bl;
   int m_error_result;
-
-  std::string m_last_metadata_key;
-  std::map<std::string, bufferlist> m_metadata;
 
   void send_v1_detect_header();
   Context *handle_v1_detect_header(int *result);
@@ -91,23 +99,31 @@ private:
   void send_v2_get_name();
   Context *handle_v2_get_name(int *result);
 
-  void send_v2_get_immutable_metadata();
-  Context *handle_v2_get_immutable_metadata(int *result);
+  void send_v2_get_name_from_trash();
+  Context *handle_v2_get_name_from_trash(int *result);
+
+  void send_v2_get_initial_metadata();
+  Context *handle_v2_get_initial_metadata(int *result);
 
   void send_v2_get_stripe_unit_count();
   Context *handle_v2_get_stripe_unit_count(int *result);
 
+  void send_v2_get_create_timestamp();
+  Context *handle_v2_get_create_timestamp(int *result);
+
+  void send_v2_get_access_modify_timestamp();
+  Context *handle_v2_get_access_modify_timestamp(int *result);
+
   void send_v2_get_data_pool();
   Context *handle_v2_get_data_pool(int *result);
 
-  void send_v2_apply_metadata();
-  Context *handle_v2_apply_metadata(int *result);
-
-  void send_register_watch();
-  Context *handle_register_watch(int *result);
-
   void send_refresh();
   Context *handle_refresh(int *result);
+
+  Context *send_init_cache(int *result);
+
+  Context *send_register_watch(int *result);
+  Context *handle_register_watch(int *result);
 
   Context *send_set_snap(int *result);
   Context *handle_set_snap(int *result);

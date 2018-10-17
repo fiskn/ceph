@@ -342,12 +342,13 @@ def task(ctx, config):
         - deep-scrub [0-9]+ errors
         - repair 0 missing, 1 inconsistent objects
         - repair [0-9]+ errors, [0-9]+ fixed
-        - shard [0-9]+ missing
+        - shard [0-9]+ .* : missing
         - deep-scrub 1 missing, 1 inconsistent objects
         - does not match object info size
         - attr name mistmatch
         - deep-scrub 1 missing, 0 inconsistent objects
         - failed to pick suitable auth object
+        - candidate size [0-9]+ info size [0-9]+ mismatch
       conf:
         osd:
           osd deep scrub update digest min age: 0
@@ -375,8 +376,7 @@ def task(ctx, config):
     for i in range(num_osds):
         manager.raw_cluster_cmd('tell', 'osd.%d' % i, 'injectargs',
                                 '--', '--osd-objectstore-fuse')
-    for i in range(num_osds):
-        manager.raw_cluster_cmd('tell', 'osd.%d' % i, 'flush_pg_stats')
+    manager.flush_pg_stats(range(num_osds))
     manager.wait_for_clean()
 
     # write some data

@@ -1,4 +1,4 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 /*
  * Ceph - scalable distributed file system
@@ -7,16 +7,15 @@
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
- * License version 2.1, as published by the Free Software 
+ * License version 2.1, as published by the Free Software
  * Foundation.  See file COPYING.
- * 
+ *
  */
 
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <iostream>
 #include <string>
-using namespace std;
 
 #include "common/config.h"
 #include "common/errno.h"
@@ -37,32 +36,34 @@ using namespace std;
 #include "global/signal_handler.h"
 #include "common/Preforker.h"
 #include "common/safe_io.h"
-       
+
 #include <sys/types.h>
 #include <fcntl.h>
 
 #include <fuse.h>
 
+#define dout_context g_ceph_context
+
 static void fuse_usage()
 {
-  const char **argv = (const char **) malloc((2) * sizeof(char *));
-  argv[0] = "ceph-fuse";
-  argv[1] = "-h";
+  const char* argv[] = {
+    "ceph-fuse",
+    "-h",
+  };
   struct fuse_args args = FUSE_ARGS_INIT(2, (char**)argv);
-  if (fuse_parse_cmdline(&args, NULL, NULL, NULL) == -1) {
+  if (fuse_parse_cmdline(&args, nullptr, nullptr, nullptr) == -1) {
     derr << "fuse_parse_cmdline failed." << dendl;
-    fuse_opt_free_args(&args);
   }
-
-  assert(args.allocated);  // Checking fuse has realloc'd args so we can free newargv
-  free(argv);
+  ceph_assert(args.allocated);
+  fuse_opt_free_args(&args);
 }
+
 void usage()
 {
   cout <<
-"usage: ceph-fuse [-m mon-ip-addr:mon-port] <mount point> [OPTIONS]\n"
-"  --client_mountpoint/-r <root_directory>\n"
-"                    use root_directory as the mounted root, rather than the full Ceph tree.\n"
+"usage: ceph-fuse [-n client.username] [-m mon-ip-addr:mon-port] <mount point> [OPTIONS]\n"
+"  --client_mountpoint/-r <sub_directory>\n"
+"                    use sub_directory as the mounted root, rather than the full Ceph tree.\n"
 "\n";
   fuse_usage();
   generic_client_usage();
@@ -71,25 +72,45 @@ void usage()
 int main(int argc, const char **argv, const char *envp[]) {
   int filer_flags = 0;
   //cerr << "ceph-fuse starting " << myrank << "/" << world << std::endl;
-  vector<const char*> args;
+  std::vector<const char*> args;
   argv_to_vec(argc, argv, args);
   if (args.empty()) {
-    usage();
+    cerr << argv[0] << ": -h or --help for usage" << std::endl;
+    exit(1);
   }
-  env_to_vec(args);
+  if (ceph_argparse_need_usage(args)) {
+    usage();
+    exit(0);
+  }
 
-  auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
+  std::map<std::string,std::string> defaults = {
+    { "pid_file", "" },
+    { "chdir", "/" }  // FUSE will chdir("/"); be ready.
+  };
+
+  auto cct = global_init(&defaults, args, CEPH_ENTITY_TYPE_CLIENT,
 			 CODE_ENVIRONMENT_DAEMON,
 			 CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
-  for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ) {
+
+  for (auto i = args.begin(); i != args.end();) {
     if (ceph_argparse_double_dash(args, i)) {
       break;
-    } else if (ceph_argparse_flag(args, i, "--localize-reads", (char*)NULL)) {
+    } else if (ceph_argparse_flag(args, i, "--localize-reads", (char*)nullptr)) {
       cerr << "setting CEPH_OSD_FLAG_LOCALIZE_READS" << std::endl;
       filer_flags |= CEPH_OSD_FLAG_LOCALIZE_READS;
-    } else if (ceph_argparse_flag(args, i, "-h", "--help", (char*)NULL)) {
-      usage();
-      ceph_abort();
+    } else if (ceph_argparse_flag(args, i, "-V", (char*)nullptr)) {
+      const char* tmpargv[] = {
+	"ceph-fuse",
+	"-V"
+      };
+
+      struct fuse_args fargs = FUSE_ARGS_INIT(2, (char**)tmpargv);
+      if (fuse_parse_cmdline(&fargs, nullptr, nullptr, nullptr) == -1) {
+       derr << "fuse_parse_cmdline failed." << dendl;
+      }
+      ceph_assert(fargs.allocated);
+      fuse_opt_free_args(&fargs);
+      exit(0);
     } else {
       ++i;
     }
@@ -100,61 +121,70 @@ int main(int argc, const char **argv, const char *envp[]) {
   int newargc;
   vec_to_argv(argv[0], args, &newargc, &newargv);
 
-  // FUSE will chdir("/"); be ready.
-  g_ceph_context->_conf->set_val("chdir", "/");
-  g_ceph_context->_conf->apply_changes(NULL);
-
   // check for 32-bit arch
-  if (sizeof(long) == 4) {
+#ifndef __LP64__
     cerr << std::endl;
     cerr << "WARNING: Ceph inode numbers are 64 bits wide, and FUSE on 32-bit kernels does" << std::endl;
     cerr << "         not cope well with that situation.  Expect to crash shortly." << std::endl;
     cerr << std::endl;
-  }
+#endif
 
-  global_init_prefork(g_ceph_context);
   Preforker forker;
-  if (g_conf->daemonize) {
+  auto daemonize = g_conf().get_val<bool>("daemonize");
+  if (daemonize) {
+    global_init_prefork(g_ceph_context);
+    int r;
     string err;
-    if (forker.prefork(err)) {
-      cerr << "ceph-fuse[" << err << std::endl;
-      return 1;
+    r = forker.prefork(err);
+    if (r < 0 || forker.is_parent()) {
+      // Start log if current process is about to exit. Otherwise, we hit an assert
+      // in the Ceph context destructor.
+      g_ceph_context->_log->start();
+    }
+    if (r < 0) {
+      cerr << "ceph-fuse " << err << std::endl;
+      return r;
+    }
+    if (forker.is_parent()) {
+      r = forker.parent_wait(err);
+      if (r < 0) {
+	cerr << "ceph-fuse " << err << std::endl;
+      }
+      return r;
     }
     global_init_postfork_start(cct.get());
   }
 
-
-  if (forker.is_parent()) {
-    string err;
-    int r = forker.parent_wait(err);
-    if (r) {
-      cerr << "ceph-fuse" << err << std::endl;
-    }
-    return r;
-  }
-
-  if (forker.is_child()) {
+  {
+    g_ceph_context->_conf.finalize_reexpand_meta();
     common_init_finish(g_ceph_context);
+   
+    init_async_signal_handler();
+    register_async_signal_handler(SIGHUP, sighup_handler);
 
     //cout << "child, mounting" << std::endl;
     class RemountTest : public Thread {
     public:
       CephFuse *cfuse;
       Client *client;
-      RemountTest() : cfuse(NULL), client(NULL) {}
+      RemountTest() : cfuse(nullptr), client(nullptr) {}
       void init(CephFuse *cf, Client *cl) {
 	cfuse = cf;
 	client = cl;
       }
-      virtual ~RemountTest() {}
-      virtual void *entry() {
+      ~RemountTest() override {}
+      void *entry() override {
 #if defined(__linux__)
 	int ver = get_linux_version();
-	assert(ver != 0);
-	bool can_invalidate_dentries = g_conf->client_try_dentry_invalidate &&
-				       ver < KERNEL_VERSION(3, 18, 0);
+	ceph_assert(ver != 0);
+        bool client_try_dentry_invalidate = g_conf().get_val<bool>(
+          "client_try_dentry_invalidate");
+	bool can_invalidate_dentries =
+          client_try_dentry_invalidate && ver < KERNEL_VERSION(3, 18, 0);
 	int tr = client->test_dentry_handling(can_invalidate_dentries);
-	if (tr != 0) {
+        bool client_die_on_failed_dentry_invalidate = g_conf().get_val<bool>(
+          "client_die_on_failed_dentry_invalidate");
+	if (tr != 0 && client_die_on_failed_dentry_invalidate) {
 	  cerr << "ceph-fuse[" << getpid()
 	       << "]: fuse failed dentry invalidate/remount test with error "
 	       << cpp_strerror(tr) << ", stopping" << std::endl;
@@ -186,27 +216,29 @@ int main(int argc, const char **argv, const char *envp[]) {
 
 
     // get monmap
-    Messenger *messenger = NULL;
-    Client *client;
+    Messenger *messenger = nullptr;
+    StandaloneClient *client;
     CephFuse *cfuse;
     UserPerm perms;
     int tester_r = 0;
-    void *tester_rp = NULL;
+    void *tester_rp = nullptr;
 
     MonClient *mc = new MonClient(g_ceph_context);
     int r = mc->build_initial_monmap();
-    if (r == -EINVAL)
-      usage();
+    if (r == -EINVAL) {
+      cerr << "failed to generate initial mon list" << std::endl;
+      exit(1);
+    }
     if (r < 0)
       goto out_mc_start_failed;
 
     // start up network
     messenger = Messenger::create_client_messenger(g_ceph_context, "client");
-    messenger->set_default_policy(Messenger::Policy::lossy_client(0, 0));
+    messenger->set_default_policy(Messenger::Policy::lossy_client(0));
     messenger->set_policy(entity_name_t::TYPE_MDS,
-			  Messenger::Policy::lossless_client(0, 0));
+			  Messenger::Policy::lossless_client(0));
 
-    client = new Client(messenger, mc);
+    client = new StandaloneClient(messenger, mc);
     if (filer_flags) {
       client->set_filer_flags(filer_flags);
     }
@@ -226,9 +258,6 @@ int main(int argc, const char **argv, const char *envp[]) {
       goto out_messenger_start_failed;
     }
 
-    init_async_signal_handler();
-    register_async_signal_handler(SIGHUP, sighup_handler);
-
     // start client
     r = client->init();
     if (r < 0) {
@@ -238,15 +267,23 @@ int main(int argc, const char **argv, const char *envp[]) {
     
     client->update_metadata("mount_point", cfuse->get_mount_point());
     perms = client->pick_my_perms();
-    // start up fuse
-    // use my argc, argv (make sure you pass a mount point!)
-    r = client->mount(g_conf->client_mountpoint.c_str(), perms,
-		      g_ceph_context->_conf->fuse_require_active_mds);
-    if (r < 0) {
-      if (r == CEPH_FUSE_NO_MDS_UP)
-        cerr << "ceph-fuse[" << getpid() << "]: probably no MDS server is up?" << std::endl;
-      cerr << "ceph-fuse[" << getpid() << "]: ceph mount failed with " << cpp_strerror(-r) << std::endl;
-      goto out_shutdown;
+    {
+      // start up fuse
+      // use my argc, argv (make sure you pass a mount point!)
+      auto client_mountpoint = g_conf().get_val<std::string>(
+        "client_mountpoint");
+      auto mountpoint = client_mountpoint.c_str();
+      auto fuse_require_active_mds = g_conf().get_val<bool>(
+        "fuse_require_active_mds");
+      r = client->mount(mountpoint, perms, fuse_require_active_mds);
+      if (r < 0) {
+        if (r == CEPH_FUSE_NO_MDS_UP) {
+          cerr << "ceph-fuse[" << getpid() << "]: probably no MDS server is up?" << std::endl;
+        }
+        cerr << "ceph-fuse[" << getpid() << "]: ceph mount failed with " << cpp_strerror(-r) << std::endl;
+        r = EXIT_FAILURE;
+        goto out_shutdown;
+      }
     }
 
     r = cfuse->start();
@@ -263,8 +300,7 @@ int main(int argc, const char **argv, const char *envp[]) {
     tester_r = static_cast<int>(reinterpret_cast<uint64_t>(tester_rp));
     cerr << "ceph-fuse[" << getpid() << "]: fuse finished with error " << r
 	 << " and tester_r " << tester_r <<std::endl;
-    
-    
+
   out_client_unmount:
     client->unmount();
     cfuse->finalize();
@@ -279,13 +315,16 @@ int main(int argc, const char **argv, const char *envp[]) {
     messenger->wait();
   out_messenger_start_failed:
     delete cfuse;
+    cfuse = nullptr;
     delete client;
+    client = nullptr;
     delete messenger;
+    messenger = nullptr;
   out_mc_start_failed:
     free(newargv);
     delete mc;
+    mc = nullptr;
     //cout << "child done" << std::endl;
     return forker.signal_exit(r);
   }
 }
-

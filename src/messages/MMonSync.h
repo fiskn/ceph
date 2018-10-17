@@ -15,10 +15,12 @@
 
 #include "msg/Message.h"
 
-class MMonSync : public Message
-{
-  static const int HEAD_VERSION = 2;
-  static const int COMPAT_VERSION = 2;
+class MMonSync : public MessageInstance<MMonSync> {
+public:
+  friend factory;
+private:
+  static constexpr int HEAD_VERSION = 2;
+  static constexpr int COMPAT_VERSION = 2;
 
 public:
   /**
@@ -49,31 +51,31 @@ public:
     case OP_CHUNK: return "chunk";
     case OP_LAST_CHUNK: return "last_chunk";
     case OP_NO_COOKIE: return "no_cookie";
-    default: assert(0 == "unknown op type"); return NULL;
+    default: ceph_abort_msg("unknown op type"); return NULL;
     }
   }
 
-  uint32_t op;
-  uint64_t cookie;
-  version_t last_committed;
+  uint32_t op = 0;
+  uint64_t cookie = 0;
+  version_t last_committed = 0;
   pair<string,string> last_key;
   bufferlist chunk_bl;
   entity_inst_t reply_to;
 
   MMonSync()
-    : Message(MSG_MON_SYNC, HEAD_VERSION, COMPAT_VERSION)
+    : MessageInstance(MSG_MON_SYNC, HEAD_VERSION, COMPAT_VERSION)
   { }
 
   MMonSync(uint32_t op, uint64_t c = 0)
-    : Message(MSG_MON_SYNC, HEAD_VERSION, COMPAT_VERSION),
+    : MessageInstance(MSG_MON_SYNC, HEAD_VERSION, COMPAT_VERSION),
       op(op),
       cookie(c),
       last_committed(0)
   { }
 
-  const char *get_type_name() const { return "mon_sync"; }
+  const char *get_type_name() const override { return "mon_sync"; }
 
-  void print(ostream& out) const {
+  void print(ostream& out) const override {
     out << "mon_sync(" << get_opname(op);
     if (cookie)
       out << " cookie " << cookie;
@@ -86,25 +88,26 @@ public:
     out << ")";
   }
 
-  void encode_payload(uint64_t features) {
-    ::encode(op, payload);
-    ::encode(cookie, payload);
-    ::encode(last_committed, payload);
-    ::encode(last_key.first, payload);
-    ::encode(last_key.second, payload);
-    ::encode(chunk_bl, payload);
-    ::encode(reply_to, payload, features);
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
+    encode(op, payload);
+    encode(cookie, payload);
+    encode(last_committed, payload);
+    encode(last_key.first, payload);
+    encode(last_key.second, payload);
+    encode(chunk_bl, payload);
+    encode(reply_to, payload, features);
   }
 
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
-    ::decode(op, p);
-    ::decode(cookie, p);
-    ::decode(last_committed, p);
-    ::decode(last_key.first, p);
-    ::decode(last_key.second, p);
-    ::decode(chunk_bl, p);
-    ::decode(reply_to, p);
+  void decode_payload() override {
+    auto p = payload.cbegin();
+    decode(op, p);
+    decode(cookie, p);
+    decode(last_committed, p);
+    decode(last_key.first, p);
+    decode(last_key.second, p);
+    decode(chunk_bl, p);
+    decode(reply_to, p);
   }
 };
 

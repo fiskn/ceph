@@ -8,11 +8,12 @@
 #include <string>
 #include <include/types.h>
 
+#include <boost/optional.hpp>
+#include <boost/utility/string_ref.hpp>
+
 #include "common/debug.h"
 
 #include "rgw_basic_types.h"
-
-using namespace std;
 
 #define RGW_PERM_NONE            0x00
 #define RGW_PERM_READ            0x01
@@ -25,6 +26,8 @@ using namespace std;
                                   RGW_PERM_READ_ACP | RGW_PERM_WRITE_ACP )
 #define RGW_PERM_ALL_S3          RGW_PERM_FULL_CONTROL
 #define RGW_PERM_INVALID         0xFF00
+
+static constexpr char RGW_REFERER_WILDCARD[] = "*";
 
 enum ACLGranteeTypeEnum {
 /* numbers are encoded, should not change */
@@ -54,12 +57,12 @@ public:
 
   void encode(bufferlist& bl) const {
     ENCODE_START(2, 2, bl);
-    ::encode(flags, bl);
+    encode(flags, bl);
     ENCODE_FINISH(bl);
   }
-  void decode(bufferlist::iterator& bl) {
+  void decode(bufferlist::const_iterator& bl) {
     DECODE_START_LEGACY_COMPAT_LEN(2, 2, 2, bl);
-    ::decode(flags, bl);
+    decode(flags, bl);
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
@@ -80,12 +83,12 @@ public:
 //  virtual void set(const char *s) = 0;
   void encode(bufferlist& bl) const {
     ENCODE_START(2, 2, bl);
-    ::encode(type, bl);
+    encode(type, bl);
     ENCODE_FINISH(bl);
   }
-  void decode(bufferlist::iterator& bl) {
+  void decode(bufferlist::const_iterator& bl) {
     DECODE_START_LEGACY_COMPAT_LEN(2, 2, 2, bl);
-    ::decode(type, bl);
+    decode(type, bl);
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
@@ -140,40 +143,40 @@ public:
 
   void encode(bufferlist& bl) const {
     ENCODE_START(5, 3, bl);
-    ::encode(type, bl);
+    encode(type, bl);
     string s;
     id.to_str(s);
-    ::encode(s, bl);
+    encode(s, bl);
     string uri;
-    ::encode(uri, bl);
-    ::encode(email, bl);
-    ::encode(permission, bl);
-    ::encode(name, bl);
+    encode(uri, bl);
+    encode(email, bl);
+    encode(permission, bl);
+    encode(name, bl);
     __u32 g = (__u32)group;
-    ::encode(g, bl);
-    ::encode(url_spec, bl);
+    encode(g, bl);
+    encode(url_spec, bl);
     ENCODE_FINISH(bl);
   }
-  void decode(bufferlist::iterator& bl) {
+  void decode(bufferlist::const_iterator& bl) {
     DECODE_START_LEGACY_COMPAT_LEN(5, 3, 3, bl);
-    ::decode(type, bl);
+    decode(type, bl);
     string s;
-    ::decode(s, bl);
+    decode(s, bl);
     id.from_str(s);
     string uri;
-    ::decode(uri, bl);
-    ::decode(email, bl);
-    ::decode(permission, bl);
-    ::decode(name, bl);
+    decode(uri, bl);
+    decode(email, bl);
+    decode(permission, bl);
+    decode(name, bl);
     if (struct_v > 1) {
       __u32 g;
-      ::decode(g, bl);
+      decode(g, bl);
       group = (ACLGroupTypeEnum)g;
     } else {
       group = uri_to_group(uri);
     }
     if (struct_v >= 5) {
-      ::decode(url_spec, bl);
+      decode(url_spec, bl);
     } else {
       url_spec.clear();
     }
@@ -214,20 +217,24 @@ struct ACLReferer {
       perm(perm) {
   }
 
-  bool is_match(std::string http_referer) const {
-    if (http_referer == url_spec) {
+  bool is_match(boost::string_ref http_referer) const {
+    const auto http_host = get_http_host(http_referer);
+    if (!http_host || http_host->length() < url_spec.length()) {
+      return false;
+    }
+
+    if ("*" == url_spec) {
       return true;
     }
 
-    if (http_referer.length() < url_spec.length()) {
-      return false;
+    if (http_host->compare(url_spec) == 0) {
+      return true;
     }
 
     if ('.' == url_spec[0]) {
       /* Wildcard support: a referer matches the spec when its last char are
        * perfectly equal to spec. */
-      return !http_referer.compare(http_referer.length() - url_spec.length(),
-                                   url_spec.length(), url_spec);
+      return http_host->ends_with(url_spec);
     }
 
     return false;
@@ -235,21 +242,45 @@ struct ACLReferer {
 
   void encode(bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
-    ::encode(url_spec, bl);
-    ::encode(perm, bl);
+    encode(url_spec, bl);
+    encode(perm, bl);
     ENCODE_FINISH(bl);
   }
-  void decode(bufferlist::iterator& bl) {
+  void decode(bufferlist::const_iterator& bl) {
     DECODE_START_LEGACY_COMPAT_LEN(1, 1, 1, bl);
-    ::decode(url_spec, bl);
-    ::decode(perm, bl);
+    decode(url_spec, bl);
+    decode(perm, bl);
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
+
+private:
+  boost::optional<boost::string_ref> get_http_host(const boost::string_ref url) const {
+    size_t pos = url.find("://");
+    if (pos == boost::string_ref::npos || url.starts_with("://") ||
+        url.ends_with("://") || url.ends_with('@')) {
+      return boost::none;
+    }
+    boost::string_ref url_sub = url.substr(pos + strlen("://"));  
+    pos = url_sub.find('@');
+    if (pos != boost::string_ref::npos) {
+      url_sub = url_sub.substr(pos + 1);
+    }
+    pos = url_sub.find_first_of("/:");
+    if (pos == boost::string_ref::npos) {
+      /* no port or path exists */
+      return url_sub;
+    }
+    return url_sub.substr(0, pos);
+  }
 };
 WRITE_CLASS_ENCODER(ACLReferer)
 
-class RGWIdentityApplier;
+namespace rgw {
+namespace auth {
+  class Identity;
+}
+}
 
 class RGWAccessControlList
 {
@@ -272,28 +303,31 @@ public:
 
   virtual ~RGWAccessControlList() {}
 
-  uint32_t get_perm(const RGWIdentityApplier& auth_identity,
+  uint32_t get_perm(const DoutPrefixProvider* dpp,
+                    const rgw::auth::Identity& auth_identity,
                     uint32_t perm_mask);
   uint32_t get_group_perm(ACLGroupTypeEnum group, uint32_t perm_mask);
-  uint32_t get_referer_perm(const std::string http_referer, uint32_t perm_mask);
+  uint32_t get_referer_perm(uint32_t current_perm,
+                            std::string http_referer,
+                            uint32_t perm_mask);
   void encode(bufferlist& bl) const {
     ENCODE_START(4, 3, bl);
     bool maps_initialized = true;
-    ::encode(maps_initialized, bl);
-    ::encode(acl_user_map, bl);
-    ::encode(grant_map, bl);
-    ::encode(acl_group_map, bl);
-    ::encode(referer_list, bl);
+    encode(maps_initialized, bl);
+    encode(acl_user_map, bl);
+    encode(grant_map, bl);
+    encode(acl_group_map, bl);
+    encode(referer_list, bl);
     ENCODE_FINISH(bl);
   }
-  void decode(bufferlist::iterator& bl) {
+  void decode(bufferlist::const_iterator& bl) {
     DECODE_START_LEGACY_COMPAT_LEN(4, 3, 3, bl);
     bool maps_initialized;
-    ::decode(maps_initialized, bl);
-    ::decode(acl_user_map, bl);
-    ::decode(grant_map, bl);
+    decode(maps_initialized, bl);
+    decode(acl_user_map, bl);
+    decode(grant_map, bl);
     if (struct_v >= 2) {
-      ::decode(acl_group_map, bl);
+      decode(acl_group_map, bl);
     } else if (!maps_initialized) {
       multimap<string, ACLGrant>::iterator iter;
       for (iter = grant_map.begin(); iter != grant_map.end(); ++iter) {
@@ -302,7 +336,7 @@ public:
       }
     }
     if (struct_v >= 4) {
-      ::decode(referer_list, bl);
+      decode(referer_list, bl);
     }
     DECODE_FINISH(bl);
   }
@@ -339,19 +373,20 @@ public:
     ENCODE_START(3, 2, bl);
     string s;
     id.to_str(s);
-    ::encode(s, bl);
-    ::encode(display_name, bl);
+    encode(s, bl);
+    encode(display_name, bl);
     ENCODE_FINISH(bl);
   }
-  void decode(bufferlist::iterator& bl) {
+  void decode(bufferlist::const_iterator& bl) {
     DECODE_START_LEGACY_COMPAT_LEN(3, 2, 2, bl);
     string s;
-    ::decode(s, bl);
+    decode(s, bl);
     id.from_str(s);
-    ::decode(display_name, bl);
+    decode(display_name, bl);
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
+  void decode_json(JSONObj *obj);
   static void generate_test_instances(list<ACLOwner*>& o);
   void set_id(const rgw_user& _id) { id = _id; }
   void set_name(const string& name) { display_name = name; }
@@ -379,32 +414,34 @@ public:
     acl.set_ctx(ctx);
   }
 
-  uint32_t get_perm(const RGWIdentityApplier& auth_identity,
+  uint32_t get_perm(const DoutPrefixProvider* dpp,
+                    const rgw::auth::Identity& auth_identity,
                     uint32_t perm_mask,
                     const char * http_referer);
   uint32_t get_group_perm(ACLGroupTypeEnum group, uint32_t perm_mask);
-  bool verify_permission(const RGWIdentityApplier& auth_identity,
+  bool verify_permission(const DoutPrefixProvider* dpp,
+                         const rgw::auth::Identity& auth_identity,
                          uint32_t user_perm_mask,
                          uint32_t perm,
                          const char * http_referer = nullptr);
 
   void encode(bufferlist& bl) const {
     ENCODE_START(2, 2, bl);
-    ::encode(owner, bl);
-    ::encode(acl, bl);
+    encode(owner, bl);
+    encode(acl, bl);
     ENCODE_FINISH(bl);
   }
-  void decode(bufferlist::iterator& bl) {
+  void decode(bufferlist::const_iterator& bl) {
     DECODE_START_LEGACY_COMPAT_LEN(2, 2, 2, bl);
-    ::decode(owner, bl);
-    ::decode(acl, bl);
+    decode(owner, bl);
+    decode(acl, bl);
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
   static void generate_test_instances(list<RGWAccessControlPolicy*>& o);
-  void decode_owner(bufferlist::iterator& bl) { // sometimes we only need that, should be faster
+  void decode_owner(bufferlist::const_iterator& bl) { // sometimes we only need that, should be faster
     DECODE_START_LEGACY_COMPAT_LEN(2, 2, 2, bl);
-    ::decode(owner, bl);
+    decode(owner, bl);
     DECODE_FINISH(bl);
   }
 

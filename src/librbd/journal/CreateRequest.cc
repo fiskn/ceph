@@ -3,7 +3,7 @@
 
 #include "common/dout.h"
 #include "common/errno.h"
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 #include "librbd/Utils.h"
 #include "common/Timer.h"
 #include "common/WorkQueue.h"
@@ -23,17 +23,16 @@ namespace journal {
 
 template<typename I>
 CreateRequest<I>::CreateRequest(IoCtx &ioctx, const std::string &imageid,
-                                              uint8_t order, uint8_t splay_width,
-                                              const std::string &object_pool,
-                                              uint64_t tag_class, TagData &tag_data,
-                                              const std::string &client_id,
-                                              ContextWQ *op_work_queue,
-                                              Context *on_finish)
-  : m_image_id(imageid), m_order(order), m_splay_width(splay_width),
-    m_object_pool(object_pool), m_tag_class(tag_class), m_tag_data(tag_data),
-    m_image_client_id(client_id), m_op_work_queue(op_work_queue),
-    m_on_finish(on_finish) {
-  m_ioctx.dup(ioctx);
+                                uint8_t order, uint8_t splay_width,
+                                const std::string &object_pool,
+                                uint64_t tag_class, TagData &tag_data,
+                                const std::string &client_id,
+                                ContextWQ *op_work_queue,
+                                Context *on_finish)
+  : m_ioctx(ioctx), m_image_id(imageid), m_order(order),
+    m_splay_width(splay_width), m_object_pool(object_pool),
+    m_tag_class(tag_class), m_tag_data(tag_data), m_image_client_id(client_id),
+    m_op_work_queue(op_work_queue), m_on_finish(on_finish) {
   m_cct = reinterpret_cast<CephContext *>(m_ioctx.cct());
 }
 
@@ -73,6 +72,7 @@ void CreateRequest<I>::get_pool_id() {
     complete(r);
     return;
   }
+  data_ioctx.set_namespace(m_ioctx.get_namespace());
 
   m_pool_id = data_ioctx.get_id();
   create_journal();
@@ -113,7 +113,7 @@ void CreateRequest<I>::allocate_journal_tag() {
   using klass = CreateRequest<I>;
   Context *ctx = create_context_callback<klass, &klass::handle_journal_tag>(this);
 
-  ::encode(m_tag_data, m_bl);
+  encode(m_tag_data, m_bl);
   m_journaler->allocate_tag(m_tag_class, m_bl, &m_tag, ctx);
 }
 
@@ -136,7 +136,7 @@ void CreateRequest<I>::register_client() {
   ldout(m_cct, 20) << this << " " << __func__ << dendl;
 
   m_bl.clear();
-  ::encode(ClientData{ImageClientMeta{m_tag.tag_class}}, m_bl);
+  encode(ClientData{ImageClientMeta{m_tag.tag_class}}, m_bl);
 
   using klass = CreateRequest<I>;
   Context *ctx = create_context_callback<klass, &klass::handle_register_client>(this);

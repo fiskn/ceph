@@ -1,3 +1,5 @@
+:orphan:
+
 =================================
 Proposed Next Steps for ECBackend
 =================================
@@ -75,7 +77,7 @@ object keys. Perhaps some modeling here can help resolve this
 issue. The data of the temporary object wants to be located as close
 to the data of the base object as possible. This may be best performed
 by adding a new ObjectStore creation primitive that takes the base
-object as an addtional parameter that is a hint to the allocator.
+object as an additional parameter that is a hint to the allocator.
 
 Sam: I think that the short lived thing may be a red herring.  We'll
 be updating the donor and primary objects atomically, so it seems like
@@ -222,7 +224,7 @@ code necessarily has designated parity shards which see every write
 might be desirable to rotate the shards based on object hash).  Even
 if you chose to designate a shard as witnessing all writes, the pg
 might be degraded with that particular shard missing.  This is a bit
-tricky, currently reads and writes implicitely return the most recent
+tricky, currently reads and writes implicitly return the most recent
 version of the object written.  On reads, we'd have to read K shards
 to answer that question.  We can get around that by adding a "don't
 tell me the current version" flag.  Writes are more problematic: we
@@ -232,17 +234,16 @@ new object_info and log_entry.
 A truly terrifying option would be to eliminate version and
 prior_version entirely from the object_info_t.  There are a few
 specific purposes it serves:
-(1) On OSD startup, we prime the missing set by scanning backwards
-		from last_update to last_complete comparing the stored object's
-		object_info_t to the version of most recent log entry.
-(2) During backfill, we compare versions between primary and target
-		to avoid some pushes.
 
-We use it elsewhere as well
-(3) While pushing and pulling objects, we verify the version.
-(4) We return it on reads and writes and allow the librados user to
-		assert it atomically on writesto allow the user to deal with write
-		races (used extensively by rbd).
+#. On OSD startup, we prime the missing set by scanning backwards
+   from last_update to last_complete comparing the stored object's
+   object_info_t to the version of most recent log entry.
+#. During backfill, we compare versions between primary and target
+   to avoid some pushes. We use it elsewhere as well
+#. While pushing and pulling objects, we verify the version.
+#. We return it on reads and writes and allow the librados user to
+   assert it atomically on writesto allow the user to deal with write
+   races (used extensively by rbd).
 
 Case (3) isn't actually essential, just convenient.  Oh well.  (4)
 is more annoying. Writes are easy since we know the version.  Reads
@@ -253,7 +254,7 @@ user version assert on ec for now (I think?  Only user is rgw bucket
 indices iirc, and those will always be on replicated because they use
 omap).
 
-We can avoid (1) by maintaining the missing set explicitely.  It's
+We can avoid (1) by maintaining the missing set explicitly.  It's
 already possible for there to be a missing object without a
 corresponding log entry (Consider the case where the most recent write
 is to an object which has not been updated in weeks.  If that write
@@ -354,7 +355,7 @@ though.  It's a bit silly since all "shards" see all writes, but it
 would still let us implement and partially test the augmented backfill
 code as well as the extra pg log entry fields -- this depends on the
 explicit pg log entry branch having already merged.  It's not entirely
-clear to me that this one is worth doing seperately.  It's enough code
+clear to me that this one is worth doing separately.  It's enough code
 that I'd really prefer to get it done independently, but it's also a
 fair amount of scaffolding that will be later discarded.
 

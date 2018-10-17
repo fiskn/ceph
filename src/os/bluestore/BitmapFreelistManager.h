@@ -9,14 +9,15 @@
 #include <string>
 #include <mutex>
 
+#include "common/ceph_mutex.h"
 #include "include/buffer.h"
 #include "kv/KeyValueDB.h"
 
 class BitmapFreelistManager : public FreelistManager {
   std::string meta_prefix, bitmap_prefix;
   KeyValueDB *kvdb;
-  ceph::shared_ptr<KeyValueDB::MergeOperator> merge_op;
-  std::mutex lock;
+  std::shared_ptr<KeyValueDB::MergeOperator> merge_op;
+  ceph::mutex lock = ceph::make_mutex("BitmapFreelistManager::lock");
 
   uint64_t size;            ///< size of device (bytes)
   uint64_t bytes_per_block; ///< bytes per block (bdev_block_size)
@@ -34,7 +35,7 @@ class BitmapFreelistManager : public FreelistManager {
   bufferlist enumerate_bl;   ///< current key at enumerate_offset
   int enumerate_bl_pos;      ///< bit position in enumerate_bl
 
-  uint64_t get_offset(uint64_t key_off, int bit) {
+  uint64_t _get_offset(uint64_t key_off, int bit) {
     return key_off + bit * bytes_per_block;
   }
 
@@ -46,12 +47,13 @@ class BitmapFreelistManager : public FreelistManager {
     KeyValueDB::Transaction txn);
 
 public:
-  BitmapFreelistManager(KeyValueDB *db, string meta_prefix,
+  BitmapFreelistManager(CephContext* cct, KeyValueDB *db, string meta_prefix,
 			string bitmap_prefix);
 
   static void setup_merge_operator(KeyValueDB *db, string prefix);
 
-  int create(uint64_t size, KeyValueDB::Transaction txn) override;
+  int create(uint64_t size, uint64_t granularity,
+	     KeyValueDB::Transaction txn) override;
 
   int init() override;
   void shutdown() override;
@@ -68,9 +70,13 @@ public:
     uint64_t offset, uint64_t length,
     KeyValueDB::Transaction txn) override;
 
-  bool supports_parallel_transactions() override {
-    return true;
+  inline uint64_t get_alloc_units() const override {
+    return size / bytes_per_block;
   }
+  inline uint64_t get_alloc_size() const override {
+    return bytes_per_block;
+  }
+
 };
 
 #endif

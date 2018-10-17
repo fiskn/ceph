@@ -158,13 +158,11 @@ class StripedStashedLayout(Workload):
         # Create a dir with a striped layout set on it
         self._mount.run_shell(["mkdir", "stripey"])
 
-        self._mount.run_shell([
-            "setfattr", "-n", "ceph.dir.layout", "-v",
-            "stripe_unit={ss} stripe_count={sc} object_size={os} pool={pool}".format(
-                ss=self.ss, os=self.os, sc=self.sc,
-                pool=self._filesystem.get_data_pool_name()
-            ),
-            "./stripey"])
+        self._mount.setfattr("./stripey", "ceph.dir.layout",
+             "stripe_unit={ss} stripe_count={sc} object_size={os} pool={pool}".format(
+                 ss=self.ss, os=self.os, sc=self.sc,
+                 pool=self._filesystem.get_data_pool_name()
+             ))
 
         # Write files, then flush metadata so that its layout gets written into an xattr
         for i, n_bytes in enumerate(self.interesting_sizes):
@@ -289,15 +287,14 @@ class NonDefaultLayout(Workload):
     """
     def write(self):
         self._mount.run_shell(["touch", "datafile"])
-        self._mount.run_shell(["setfattr", "-n", "ceph.file.layout.object_size", "-v", "8388608", "./datafile"])
+        self._mount.setfattr("./datafile", "ceph.file.layout.object_size", "8388608")
         self._mount.run_shell(["dd", "if=/dev/urandom", "of=./datafile", "bs=1M", "count=32"])
         self._initial_state = self._mount.stat("datafile")
 
     def validate(self):
-        p = self._mount.run_shell(["getfattr", "--only-values", "-n", "ceph.file.layout.object_size", "./datafile"])
-
         # Check we got the layout reconstructed properly
-        object_size = int(p.stdout.getvalue().strip())
+        object_size = int(self._mount.getfattr(
+            "./datafile", "ceph.file.layout.object_size"))
         self.assert_equal(object_size, 8388608)
 
         # Check we got the file size reconstructed properly
@@ -319,6 +316,7 @@ class TestDataScan(CephFSTestCase):
         """
 
         # First, inject some files
+
         workload.write()
 
         # Unmount the client and flush the journal: the tool should also cope with
@@ -343,7 +341,6 @@ class TestDataScan(CephFSTestCase):
         self.fs.mon_manager.raw_cluster_cmd('fs', 'reset', self.fs.name,
                 '--yes-i-really-mean-it')
 
-        # Attempt to start an MDS, see that it goes into damaged state
         self.fs.mds_restart()
 
         def get_state(mds_id):
@@ -357,15 +354,17 @@ class TestDataScan(CephFSTestCase):
                     "up:standby",
                     timeout=60)
 
+        self.fs.table_tool([self.fs.name + ":0", "reset", "session"])
+        self.fs.table_tool([self.fs.name + ":0", "reset", "snap"])
+        self.fs.table_tool([self.fs.name + ":0", "reset", "inode"])
+
         # Run the recovery procedure
-        self.fs.table_tool(["0", "reset", "session"])
-        self.fs.table_tool(["0", "reset", "snap"])
-        self.fs.table_tool(["0", "reset", "inode"])
         if False:
             with self.assertRaises(CommandFailedError):
                 # Normal reset should fail when no objects are present, we'll use --force instead
-                self.fs.journal_tool(["journal", "reset"])
-        self.fs.journal_tool(["journal", "reset", "--force"])
+                self.fs.journal_tool(["journal", "reset"], 0)
+
+        self.fs.journal_tool(["journal", "reset", "--force"], 0)
         self.fs.data_scan(["init"])
         self.fs.data_scan(["scan_extents", self.fs.get_data_pool_name()], worker_count=workers)
         self.fs.data_scan(["scan_inodes", self.fs.get_data_pool_name()], worker_count=workers)
@@ -425,9 +424,6 @@ class TestDataScan(CephFSTestCase):
         """
         That when injecting a dentry into a fragmented directory, we put it in the right fragment.
         """
-
-        self.fs.mon_manager.raw_cluster_cmd("mds", "set", "allow_dirfrags", "true",
-                                            "--yes-i-really-mean-it")
 
         file_count = 100
         file_names = ["%s" % n for n in range(0, file_count)]

@@ -17,18 +17,27 @@
 #ifndef CEPH_INFINIBAND_H
 #define CEPH_INFINIBAND_H
 
-#include <infiniband/verbs.h>
+#include <boost/pool/pool.hpp>
+// need this because boost messes with ceph log/assert definitions
+#include "include/ceph_assert.h"
 
+#include <infiniband/verbs.h>
+#include <rdma/rdma_cma.h>
+
+#include <atomic>
 #include <string>
 #include <vector>
+
+#include <infiniband/verbs.h>
 
 #include "include/int_types.h"
 #include "include/page.h"
 #include "common/debug.h"
 #include "common/errno.h"
+#include "common/Mutex.h"
+#include "common/perf_counters.h"
 #include "msg/msg_types.h"
 #include "msg/async/net_handler.h"
-#include "common/Mutex.h"
 
 #define HUGE_PAGE_SIZE (2 * 1024 * 1024)
 #define ALIGN_TO_PAGE_SIZE(x) \
@@ -47,17 +56,17 @@ class CephContext;
 
 class Port {
   struct ibv_context* ctxt;
-  uint8_t port_num;
+  int port_num;
   struct ibv_port_attr* port_attr;
   uint16_t lid;
-  int gid_idx;
+  int gid_idx = 0;
   union ibv_gid gid;
 
  public:
   explicit Port(CephContext *cct, struct ibv_context* ictxt, uint8_t ipn);
   uint16_t get_lid() { return lid; }
   ibv_gid  get_gid() { return gid; }
-  uint8_t get_port_num() { return port_num; }
+  int get_port_num() { return port_num; }
   ibv_port_attr* get_port_attr() { return port_attr; }
   int get_gid_idx() { return gid_idx; }
 };
@@ -66,21 +75,20 @@ class Port {
 class Device {
   ibv_device *device;
   const char* name;
-  uint8_t  port_cnt;
-  Port** ports;
+  uint8_t  port_cnt = 0;
  public:
-  explicit Device(CephContext *c, ibv_device* d);
+  explicit Device(CephContext *c, ibv_device* d, struct ibv_context *dc);
   ~Device() {
-    for (uint8_t i = 0; i < port_cnt; ++i)
-      delete ports[i];
-    delete []ports;
-    assert(ibv_close_device(ctxt) == 0);
+    if (active_port) {
+      delete active_port;
+      ceph_assert(ibv_close_device(ctxt) == 0);
+    }
   }
   const char* get_name() { return name;}
   uint16_t get_lid() { return active_port->get_lid(); }
   ibv_gid get_gid() { return active_port->get_gid(); }
   int get_gid_idx() { return active_port->get_gid_idx(); }
-  void binding_port(CephContext *c, uint8_t port_num);
+  void binding_port(CephContext *c, int port_num);
   struct ibv_context *ctxt;
   ibv_device_attr *device_attr;
   Port* active_port;
@@ -89,10 +97,12 @@ class Device {
 
 class DeviceList {
   struct ibv_device ** device_list;
+  struct ibv_context ** device_context_list;
   int num;
   Device** devices;
  public:
-  DeviceList(CephContext *cct): device_list(ibv_get_device_list(&num)) {
+  explicit DeviceList(CephContext *cct): device_list(ibv_get_device_list(&num)),
+                                device_context_list(rdma_get_devices(&num)) {
     if (device_list == NULL || num == 0) {
       lderr(cct) << __func__ << " failed to get rdma device list.  " << cpp_strerror(errno) << dendl;
       ceph_abort();
@@ -100,7 +110,7 @@ class DeviceList {
     devices = new Device*[num];
 
     for (int i = 0;i < num; ++i) {
-      devices[i] = new Device(cct, device_list[i]);
+      devices[i] = new Device(cct, device_list[i], device_context_list[i]);
     }
   }
   ~DeviceList() {
@@ -112,7 +122,7 @@ class DeviceList {
   }
 
   Device* get_device(const char* device_name) {
-    assert(devices);
+    ceph_assert(devices);
     for (int i = 0; i < num; ++i) {
       if (!strlen(device_name) || !strcmp(device_name, devices[i]->get_name())) {
         return devices[i];
@@ -122,23 +132,60 @@ class DeviceList {
   }
 };
 
+// stat counters
+enum {
+  l_msgr_rdma_dispatcher_first = 94000,
+
+  l_msgr_rdma_polling,
+  l_msgr_rdma_inflight_tx_chunks,
+  l_msgr_rdma_rx_bufs_in_use,
+  l_msgr_rdma_rx_bufs_total,
+
+  l_msgr_rdma_tx_total_wc,
+  l_msgr_rdma_tx_total_wc_errors,
+  l_msgr_rdma_tx_wc_retry_errors,
+  l_msgr_rdma_tx_wc_wr_flush_errors,
+
+  l_msgr_rdma_rx_total_wc,
+  l_msgr_rdma_rx_total_wc_errors,
+  l_msgr_rdma_rx_fin,
+
+  l_msgr_rdma_handshake_errors,
+
+  l_msgr_rdma_total_async_events,
+  l_msgr_rdma_async_last_wqe_events,
+
+  l_msgr_rdma_created_queue_pair,
+  l_msgr_rdma_active_queue_pair,
+
+  l_msgr_rdma_dispatcher_last,
+};
+
+enum {
+  l_msgr_rdma_first = 95000,
+
+  l_msgr_rdma_tx_no_mem,
+  l_msgr_rdma_tx_parital_mem,
+  l_msgr_rdma_tx_failed,
+
+  l_msgr_rdma_tx_chunks,
+  l_msgr_rdma_tx_bytes,
+  l_msgr_rdma_rx_chunks,
+  l_msgr_rdma_rx_bytes,
+  l_msgr_rdma_pending_sent_conns,
+
+  l_msgr_rdma_last,
+};
+
+class RDMADispatcher;
 
 class Infiniband {
  public:
   class ProtectionDomain {
    public:
-    explicit ProtectionDomain(CephContext *cct, Device *device)
-      : pd(ibv_alloc_pd(device->ctxt))
-    {
-      if (pd == NULL) {
-        lderr(cct) << __func__ << " failed to allocate infiniband protection domain: " << cpp_strerror(errno) << dendl;
-        ceph_abort();
-      }
-    }
-    ~ProtectionDomain() {
-      int rc = ibv_dealloc_pd(pd);
-      assert(rc == 0);
-    }
+    explicit ProtectionDomain(CephContext *cct, Device *device);
+    ~ProtectionDomain();
+
     ibv_pd* const pd;
   };
 
@@ -147,254 +194,191 @@ class Infiniband {
    public:
     class Chunk {
      public:
-      Chunk(char* b, uint32_t len, ibv_mr* m) : buffer(b), bytes(len), offset(0), mr(m) {}
-      ~Chunk() {
-        assert(ibv_dereg_mr(mr) == 0);
-      }
+      Chunk(ibv_mr* m, uint32_t len, char* b);
+      ~Chunk();
 
-      void set_offset(uint32_t o) {
-        offset = o;
-      }
-
-      uint32_t get_offset() {
-        return offset;
-      }
-
-      void set_bound(uint32_t b) {
-        bound = b;
-      }
-
-      void prepare_read(uint32_t b) {
-        offset = 0;
-        bound = b;
-      }
-
-      uint32_t get_bound() {
-        return bound;
-      }
-
-      uint32_t read(char* buf, uint32_t len) {
-        uint32_t left = bound - offset;
-        if (left >= len) {
-          memcpy(buf, buffer+offset, len);
-          offset += len;
-          return len;
-        } else {
-          memcpy(buf, buffer+offset, left);
-          offset = 0;
-          bound = 0;
-          return left;
-        }
-      }
-
-      uint32_t write(char* buf, uint32_t len) {
-        uint32_t left = bytes - offset;
-        if (left >= len) {
-          memcpy(buffer+offset, buf, len);
-          offset += len;
-          return len;
-        } else {
-          memcpy(buffer+offset, buf, left);
-          offset = bytes;
-          return left;
-        }
-      }
-
-      bool full() {
-        return offset == bytes;
-      }
-
-      bool over() {
-        return offset == bound;
-      }
-
-      void clear() {
-        offset = 0;
-        bound = 0;
-      }
-
-      void post_srq(Infiniband *ib) {
-        ib->post_chunk(this);
-      }
-
-      void set_owner(uint64_t o) {
-        owner = o;
-      }
-
-      uint64_t get_owner() {
-        return owner;
-      }
+      void set_offset(uint32_t o);
+      uint32_t get_offset();
+      void set_bound(uint32_t b);
+      void prepare_read(uint32_t b);
+      uint32_t get_bound();
+      uint32_t read(char* buf, uint32_t len);
+      uint32_t write(char* buf, uint32_t len);
+      bool full();
+      bool over();
+      void clear();
 
      public:
-      char* buffer;
-      uint32_t bytes;
-      uint32_t bound;
-      uint32_t offset;
       ibv_mr* mr;
-      uint64_t owner;
+      uint32_t lkey = 0;
+      uint32_t bytes;
+      uint32_t bound = 0;
+      uint32_t offset;
+      char* buffer; // TODO: remove buffer/refactor TX
+      char  data[0];
     };
 
     class Cluster {
      public:
-      Cluster(MemoryManager& m, uint32_t s) : manager(m), chunk_size(s), lock("cluster_lock"){}
-      Cluster(MemoryManager& m, uint32_t s, uint32_t n) : manager(m), chunk_size(s), lock("cluster_lock"){
-        add(n);
+      Cluster(MemoryManager& m, uint32_t s);
+      ~Cluster();
+
+      int fill(uint32_t num);
+      void take_back(std::vector<Chunk*> &ck);
+      int get_buffers(std::vector<Chunk*> &chunks, size_t bytes);
+      Chunk *get_chunk_by_buffer(const char *c) {
+        uint32_t idx = (c - base) / buffer_size;
+        Chunk *chunk = chunk_base + idx;
+        return chunk;
+      }
+      bool is_my_buffer(const char *c) const {
+        return c >= base && c < end;
       }
 
-      ~Cluster() {
-        set<Chunk*>::iterator c = all_chunks.begin();
-        while(c != all_chunks.end()) {
-          delete *c;
-          ++c;
-        }
-        if (manager.enabled_huge_page)
-          manager.free_huge_pages(base);
-        else
-          delete base;
-      }
-      int add(uint32_t num) {
-        uint32_t bytes = chunk_size * num;
-        //cihar* base = (char*)malloc(bytes);
-        if (manager.enabled_huge_page) {
-          base = (char*)manager.malloc_huge_pages(bytes);
-        } else {
-          base = (char*)memalign(CEPH_PAGE_SIZE, bytes);
-        }
-        assert(base);
-        for (uint32_t offset = 0; offset < bytes; offset += chunk_size){
-          ibv_mr* m = ibv_reg_mr(manager.pd->pd, base+offset, chunk_size, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
-          assert(m);
-          Chunk* c = new Chunk(base+offset,chunk_size,m);
-          free_chunks.push_back(c);
-          all_chunks.insert(c);
-        }
-        return 0;
-      }
-
-      void take_back(Chunk* ck) {
-        Mutex::Locker l(lock);
-        free_chunks.push_back(ck);
-      }
-
-      int get_buffers(std::vector<Chunk*> &chunks, size_t bytes) {
-        uint32_t num = bytes / chunk_size + 1;
-        if (bytes % chunk_size == 0)
-          --num;
-        int r = num;
-        Mutex::Locker l(lock);
-        if (free_chunks.empty())
-          return 0;
-        if (!bytes) {
-          free_chunks.swap(chunks);
-          r = chunks.size();
-          return r;
-        }
-        if (free_chunks.size() < num) {
-          num = free_chunks.size();
-          r = num;
-        }
-        for (uint32_t i = 0; i < num; ++i) {
-          chunks.push_back(free_chunks.back());
-          free_chunks.pop_back();
-        }
-        return r;
-      }
       MemoryManager& manager;
-      uint32_t chunk_size;
+      uint32_t buffer_size;
+      uint32_t num_chunk = 0;
       Mutex lock;
       std::vector<Chunk*> free_chunks;
-      std::set<Chunk*> all_chunks;
-      char* base;
+      char *base = nullptr;
+      char *end = nullptr;
+      Chunk* chunk_base = nullptr;
     };
 
-    MemoryManager(Device *d, ProtectionDomain *p, bool hugepage): device(d), pd(p) {
-      enabled_huge_page = hugepage;
-    }
-    ~MemoryManager() {
-      if (channel)
-        delete channel;
-      if (send)
-        delete send;
-    }
-    void* malloc_huge_pages(size_t size) {
-      size_t real_size = ALIGN_TO_PAGE_SIZE(size + HUGE_PAGE_SIZE);
-      char *ptr = (char *)mmap(NULL, real_size, PROT_READ | PROT_WRITE,MAP_PRIVATE | MAP_ANONYMOUS |MAP_POPULATE | MAP_HUGETLB,-1, 0);
-      if (ptr == MAP_FAILED) {
-        ptr = (char *)malloc(real_size);
-        if (ptr == NULL) return NULL;
-        real_size = 0;
+    class MemPoolContext {
+      PerfCounters *perf_logger;
+
+     public:
+      MemoryManager *manager;
+      unsigned n_bufs_allocated;
+      // true if it is possible to alloc
+      // more memory for the pool
+      explicit MemPoolContext(MemoryManager *m) :
+        perf_logger(nullptr),
+        manager(m),
+        n_bufs_allocated(0) {}
+      bool can_alloc(unsigned nbufs);
+      void update_stats(int val);
+      void set_stat_logger(PerfCounters *logger);
+    };
+
+    class PoolAllocator {
+      struct mem_info {
+        ibv_mr   *mr;
+        MemPoolContext *ctx;
+        unsigned nbufs;
+        Chunk    chunks[0];
+      };
+     public:
+      typedef std::size_t size_type;
+      typedef std::ptrdiff_t difference_type;
+
+      static char * malloc(const size_type bytes);
+      static void free(char * const block);
+
+      static MemPoolContext  *g_ctx;
+      static Mutex lock;
+    };
+
+    /**
+     * modify boost pool so that it is possible to
+     * have a thread safe 'context' when allocating/freeing
+     * the memory. It is needed to allow a different pool
+     * configurations and bookkeeping per CephContext and
+     * also to be able to use same allocator to deal with
+     * RX and TX pool.
+     * TODO: use boost pool to allocate TX chunks too
+     */
+    class mem_pool : public boost::pool<PoolAllocator> {
+     private:
+      MemPoolContext *ctx;
+      void *slow_malloc();
+
+     public:
+      explicit mem_pool(MemPoolContext *ctx, const size_type nrequested_size,
+          const size_type nnext_size = 32,
+          const size_type nmax_size = 0) :
+        pool(nrequested_size, nnext_size, nmax_size),
+        ctx(ctx) { }
+
+      void *malloc() {
+        if (!store().empty())
+          return (store().malloc)();
+        // need to alloc more memory...
+        // slow path code
+        return slow_malloc();
       }
-      *((size_t *)ptr) = real_size;
-      return ptr + HUGE_PAGE_SIZE;
-    }
-    void free_huge_pages(void *ptr) {
-      if (ptr == NULL) return;
-      void *real_ptr = (char *)ptr -HUGE_PAGE_SIZE;
-      size_t real_size = *((size_t *)real_ptr);
-      assert(real_size % HUGE_PAGE_SIZE == 0);
-      if (real_size != 0)
-        munmap(real_ptr, real_size);
-      else
-        free(real_ptr);
-    }
-    void register_rx_tx(uint32_t size, uint32_t rx_num, uint32_t tx_num) {
-      assert(device);
-      assert(pd);
-      channel = new Cluster(*this, size);
-      channel->add(rx_num);
+    };
 
-      send = new Cluster(*this, size);
-      send->add(tx_num);
+    MemoryManager(CephContext *c, Device *d, ProtectionDomain *p);
+    ~MemoryManager();
+
+    void* malloc(size_t size);
+    void  free(void *ptr);
+
+    void create_tx_pool(uint32_t size, uint32_t tx_num);
+    void return_tx(std::vector<Chunk*> &chunks);
+    int get_send_buffers(std::vector<Chunk*> &c, size_t bytes);
+    bool is_tx_buffer(const char* c) { return send->is_my_buffer(c); }
+    Chunk *get_tx_chunk_by_buffer(const char *c) {
+      return send->get_chunk_by_buffer(c);
     }
-    void return_tx(std::vector<Chunk*> &chunks) {
-      for (auto c : chunks) {
-        c->clear();
-        send->take_back(c);
-      }
+    uint32_t get_tx_buffer_size() const {
+      return send->buffer_size;
     }
 
-    int get_send_buffers(std::vector<Chunk*> &c, size_t bytes) {
-      return send->get_buffers(c, bytes);
+    Chunk *get_rx_buffer() {
+       return reinterpret_cast<Chunk *>(rxbuf_pool.malloc());
     }
 
-    int get_channel_buffers(std::vector<Chunk*> &chunks, size_t bytes) {
-      return channel->get_buffers(chunks, bytes);
+    void release_rx_buffer(Chunk *chunk) {
+      rxbuf_pool.free(chunk);
     }
 
-    int is_tx_chunk(Chunk* c) { return send->all_chunks.count(c);}
-    int is_rx_chunk(Chunk* c) { return channel->all_chunks.count(c);}
-    bool enabled_huge_page;
+    void set_rx_stat_logger(PerfCounters *logger) {
+      rxbuf_pool_ctx.set_stat_logger(logger);
+    }
+
+    CephContext  *cct;
    private:
-    Cluster* channel;//RECV
-    Cluster* send;// SEND
+    // TODO: Cluster -> TxPool txbuf_pool
+    // chunk layout fix
+    //  
+    Cluster* send = nullptr;// SEND
     Device *device;
     ProtectionDomain *pd;
+    MemPoolContext rxbuf_pool_ctx;
+    mem_pool     rxbuf_pool;
+
+
+    void* huge_pages_malloc(size_t size);
+    void  huge_pages_free(void *ptr);
   };
 
  private:
-  uint32_t max_send_wr;
-  uint32_t max_recv_wr;
-  uint32_t max_sge;
-  uint8_t  ib_physical_port;
-  MemoryManager* memory_manager;
-  ibv_srq* srq;             // shared receive work queue
-  Device *device;
-  ProtectionDomain *pd;
-  DeviceList device_list;
+  uint32_t tx_queue_len = 0;
+  uint32_t rx_queue_len = 0;
+  uint32_t max_sge = 0;
+  uint8_t  ib_physical_port = 0;
+  MemoryManager* memory_manager = nullptr;
+  ibv_srq* srq = nullptr;             // shared receive work queue
+  Device *device = NULL;
+  ProtectionDomain *pd = NULL;
+  DeviceList *device_list = nullptr;
   void wire_gid_to_gid(const char *wgid, union ibv_gid *gid);
   void gid_to_wire_gid(const union ibv_gid *gid, char wgid[]);
+  CephContext *cct;
+  Mutex lock;
+  bool initialized = false;
+  const std::string &device_name;
+  uint8_t port_num;
+  bool support_srq = false;
 
  public:
-  explicit Infiniband(CephContext *c, const std::string &device_name, uint8_t p);
-
-  /**
-   * Destroy an Infiniband object.
-   */
-  ~Infiniband() {
-    assert(ibv_destroy_srq(srq) == 0);
-    delete memory_manager;
-    delete pd;
-  }
+  explicit Infiniband(CephContext *c);
+  ~Infiniband();
+  void init();
+  static void verify_prereq(CephContext *cct);
 
   class CompletionChannel {
     static const uint32_t MAX_ACK_EVENT = 5000;
@@ -405,18 +389,14 @@ class Infiniband {
     uint32_t cq_events_that_need_ack;
 
    public:
-    CompletionChannel(CephContext *c, Infiniband &ib)
-      : cct(c), infiniband(ib), channel(NULL), cq(NULL), cq_events_that_need_ack(0) {}
+    CompletionChannel(CephContext *c, Infiniband &ib);
     ~CompletionChannel();
     int init();
     bool get_cq_event();
     int get_fd() { return channel->fd; }
     ibv_comp_channel* get_channel() { return channel; }
     void bind_cq(ibv_cq *c) { cq = c; }
-    void ack_events() {
-      ibv_ack_cq_events(cq, cq_events_that_need_ack);
-      cq_events_that_need_ack = 0;
-    }
+    void ack_events();
   };
 
   // this class encapsulates the creation, use, and destruction of an RC
@@ -455,7 +435,7 @@ class Infiniband {
               int ib_physical_port,  ibv_srq *srq,
               Infiniband::CompletionQueue* txcq,
               Infiniband::CompletionQueue* rxcq,
-              uint32_t max_send_wr, uint32_t max_recv_wr, uint32_t q_key = 0);
+              uint32_t tx_queue_len, uint32_t max_recv_wr, struct rdma_cm_id *cid, uint32_t q_key = 0);
     ~QueuePair();
 
     int init();
@@ -475,71 +455,24 @@ class Infiniband {
      * Get the remote queue pair number for this QueuePair, as set in #plumb().
      * QPNs are analogous to UDP/TCP port numbers.
      */
-    int get_remote_qp_number(uint32_t *rqp) const {
-      ibv_qp_attr qpa;
-      ibv_qp_init_attr qpia;
-
-      int r = ibv_query_qp(qp, &qpa, IBV_QP_DEST_QPN, &qpia);
-      if (r) {
-        lderr(cct) << __func__ << " failed to query qp: "
-          << cpp_strerror(errno) << dendl;
-        return -1;
-      }
-
-      if (rqp)
-        *rqp = qpa.dest_qp_num;
-      return 0;
-    }
+    int get_remote_qp_number(uint32_t *rqp) const;
     /**
      * Get the remote infiniband address for this QueuePair, as set in #plumb().
      * LIDs are "local IDs" in infiniband terminology. They are short, locally
      * routable addresses.
      */
-    int get_remote_lid(uint16_t *lid) const {
-      ibv_qp_attr qpa;
-      ibv_qp_init_attr qpia;
-
-      int r = ibv_query_qp(qp, &qpa, IBV_QP_AV, &qpia);
-      if (r) {
-        lderr(cct) << __func__ << " failed to query qp: "
-          << cpp_strerror(errno) << dendl;
-        return -1;
-      }
-
-      if (lid)
-        *lid = qpa.ah_attr.dlid;
-      return 0;
-    }
+    int get_remote_lid(uint16_t *lid) const;
     /**
      * Get the state of a QueuePair.
      */
-    int get_state() const {
-      ibv_qp_attr qpa;
-      ibv_qp_init_attr qpia;
-
-      int r = ibv_query_qp(qp, &qpa, IBV_QP_STATE, &qpia);
-      if (r) {
-        lderr(cct) << __func__ << " failed to get state: "
-          << cpp_strerror(errno) << dendl;
-        return -1;
-      }
-      return qpa.qp_state;
-    }
+    int get_state() const;
     /**
      * Return true if the queue pair is in an error state, false otherwise.
      */
-    bool is_error() const {
-      ibv_qp_attr qpa;
-      ibv_qp_init_attr qpia;
-
-      int r = ibv_query_qp(qp, &qpa, -1, &qpia);
-      if (r) {
-        lderr(cct) << __func__ << " failed to get state: "
-                              << cpp_strerror(errno) << dendl;
-        return true;
-      }
-      return qpa.cur_qp_state == IBV_QPS_ERR;
-    }
+    bool is_error() const;
+    void add_tx_wr(uint32_t amt) { tx_wr_inflight += amt; }
+    void dec_tx_wr(uint32_t amt) { tx_wr_inflight -= amt; }
+    uint32_t get_tx_wr() const { return tx_wr_inflight; }
     ibv_qp* get_qp() const { return qp; }
     Infiniband::CompletionQueue* get_tx_cq() const { return txcq; }
     Infiniband::CompletionQueue* get_rx_cq() const { return rxcq; }
@@ -555,6 +488,7 @@ class Infiniband {
     ibv_pd*      pd;             // protection domain
     ibv_srq*     srq;            // shared receive queue
     ibv_qp*      qp;             // infiniband verbs QP handle
+    struct rdma_cm_id *cm_id;
     Infiniband::CompletionQueue* txcq;
     Infiniband::CompletionQueue* rxcq;
     uint32_t     initial_psn;    // initial packet sequence number
@@ -562,23 +496,24 @@ class Infiniband {
     uint32_t     max_recv_wr;
     uint32_t     q_key;
     bool dead;
+    std::atomic<uint32_t> tx_wr_inflight = {0}; // counter for inflight Tx WQEs
   };
 
  public:
   typedef MemoryManager::Cluster Cluster;
   typedef MemoryManager::Chunk Chunk;
-  QueuePair* create_queue_pair(CephContext *c, CompletionQueue*, CompletionQueue*, ibv_qp_type type);
+  QueuePair* create_queue_pair(CephContext *c, CompletionQueue*, CompletionQueue*,
+      ibv_qp_type type, struct rdma_cm_id *cm_id);
   ibv_srq* create_shared_receive_queue(uint32_t max_wr, uint32_t max_sge);
-  int post_chunk(Chunk* chunk);
-  int post_channel_cluster();
-  int get_tx_buffers(std::vector<Chunk*> &c, size_t bytes) {
-    return memory_manager->get_send_buffers(c, bytes);
+  // post rx buffers to srq, return number of buffers actually posted
+  int post_chunks_to_rq(int num, ibv_qp *qp=NULL);
+  void post_chunk_to_pool(Chunk* chunk) {
+    get_memory_manager()->release_rx_buffer(chunk);
   }
+  int get_tx_buffers(std::vector<Chunk*> &c, size_t bytes);
   CompletionChannel *create_comp_channel(CephContext *c);
   CompletionQueue *create_comp_queue(CephContext *c, CompletionChannel *cc=NULL);
-  uint8_t get_ib_physical_port() {
-    return ib_physical_port;
-  }
+  uint8_t get_ib_physical_port() { return ib_physical_port; }
   int send_msg(CephContext *cct, int sd, IBSYNMsg& msg);
   int recv_msg(CephContext *cct, int sd, IBSYNMsg& msg);
   uint16_t get_lid() { return device->get_lid(); }
@@ -586,22 +521,11 @@ class Infiniband {
   MemoryManager* get_memory_manager() { return memory_manager; }
   Device* get_device() { return device; }
   int get_async_fd() { return device->ctxt->async_fd; }
-  int recall_chunk(Chunk* c) {
-    if (memory_manager->is_rx_chunk(c)) {
-      post_chunk(c);  
-      return 1;
-    } else if (memory_manager->is_tx_chunk(c)) {
-      vector<Chunk*> v;
-      v.push_back(c);
-      memory_manager->return_tx(v);  
-      return 2;
-    }
-    return -1;
-  }
-  int is_tx_chunk(Chunk* c) { return memory_manager->is_tx_chunk(c); }
-  int is_rx_chunk(Chunk* c) { return memory_manager->is_rx_chunk(c); }
+  bool is_tx_buffer(const char* c) { return memory_manager->is_tx_buffer(c);}
+  Chunk *get_tx_chunk_by_buffer(const char *c) { return memory_manager->get_tx_chunk_by_buffer(c); }
   static const char* wc_status_to_string(int status);
   static const char* qp_state_string(int status);
+  uint32_t get_rx_queue_len() const { return rx_queue_len; }
 };
 
 #endif

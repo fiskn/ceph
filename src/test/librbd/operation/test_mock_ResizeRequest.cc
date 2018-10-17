@@ -1,19 +1,56 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #include "test/librbd/test_mock_fixture.h"
 #include "test/librbd/test_support.h"
 #include "test/librbd/mock/MockImageCtx.h"
+#include "test/librbd/mock/io/MockObjectDispatch.h"
 #include "test/librados_test_stub/MockTestMemIoCtxImpl.h"
 #include "common/bit_vector.hpp"
 #include "librbd/internal.h"
 #include "librbd/ObjectMap.h"
+#include "librbd/io/ImageDispatchSpec.h"
 #include "librbd/operation/ResizeRequest.h"
 #include "librbd/operation/TrimRequest.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 namespace librbd {
+
+namespace util {
+
+inline ImageCtx* get_image_ctx(MockImageCtx* image_ctx) {
+  return image_ctx->image_ctx;
+}
+
+} // namespace util
+
+namespace io {
+
+template <>
+struct ImageDispatchSpec<MockImageCtx> {
+  static ImageDispatchSpec* s_instance;
+  AioCompletion *aio_comp = nullptr;
+
+  static ImageDispatchSpec* create_flush_request(
+      MockImageCtx &image_ctx, AioCompletion *aio_comp,
+      FlushSource flush_source, const ZTracer::Trace &parent_trace) {
+    ceph_assert(s_instance != nullptr);
+    s_instance->aio_comp = aio_comp;
+    return s_instance;
+  }
+
+  MOCK_CONST_METHOD0(send, void());
+
+  ImageDispatchSpec() {
+    s_instance = this;
+  }
+};
+
+ImageDispatchSpec<MockImageCtx>* ImageDispatchSpec<MockImageCtx>::s_instance = nullptr;
+
+} // namespace io
+
 namespace operation {
 
 template <>
@@ -23,7 +60,7 @@ public:
   static TrimRequest *create(MockImageCtx &image_ctx, Context *on_finish,
                              uint64_t original_size, uint64_t new_size,
                              ProgressContext &prog_ctx) {
-    assert(s_instance != nullptr);
+    ceph_assert(s_instance != nullptr);
     s_instance->on_finish = on_finish;
     return s_instance;
   }
@@ -44,13 +81,13 @@ TrimRequest<MockImageCtx> *TrimRequest<MockImageCtx>::s_instance = nullptr;
 
 // template definitions
 #include "librbd/operation/ResizeRequest.cc"
-#include "librbd/operation/TrimRequest.cc"
 
 namespace librbd {
 namespace operation {
 
 using ::testing::_;
 using ::testing::DoAll;
+using ::testing::Invoke;
 using ::testing::InSequence;
 using ::testing::Return;
 using ::testing::StrEq;
@@ -60,14 +97,15 @@ class TestMockOperationResizeRequest : public TestMockFixture {
 public:
   typedef ResizeRequest<MockImageCtx> MockResizeRequest;
   typedef TrimRequest<MockImageCtx> MockTrimRequest;
+  typedef io::ImageDispatchSpec<MockImageCtx> MockIoImageDispatchSpec;
 
   void expect_block_writes(MockImageCtx &mock_image_ctx, int r) {
-    EXPECT_CALL(*mock_image_ctx.aio_work_queue, block_writes(_))
+    EXPECT_CALL(*mock_image_ctx.io_work_queue, block_writes(_))
                   .WillOnce(CompleteContext(r, mock_image_ctx.image_ctx->op_work_queue));
   }
 
   void expect_unblock_writes(MockImageCtx &mock_image_ctx) {
-    EXPECT_CALL(*mock_image_ctx.aio_work_queue, unblock_writes())
+    EXPECT_CALL(*mock_image_ctx.io_work_queue, unblock_writes())
                   .Times(1);
   }
 
@@ -113,14 +151,24 @@ public:
                   .WillOnce(FinishRequest(&mock_trim_request, r, &mock_image_ctx));
   }
 
-  void expect_flush_cache(MockImageCtx &mock_image_ctx, int r) {
-    EXPECT_CALL(mock_image_ctx, flush_cache(_)).WillOnce(CompleteContext(r, NULL));
-    expect_op_work_queue(mock_image_ctx);
+  void expect_flush_cache(MockImageCtx &mock_image_ctx,
+                          MockIoImageDispatchSpec& mock_io_image_dispatch_spec,
+                          int r) {
+    EXPECT_CALL(mock_io_image_dispatch_spec, send())
+      .WillOnce(Invoke([&mock_image_ctx, &mock_io_image_dispatch_spec, r]() {
+                  auto aio_comp = mock_io_image_dispatch_spec.s_instance->aio_comp;
+                  auto ctx = new FunctionContext([aio_comp](int r) {
+                    aio_comp->get();
+                    aio_comp->fail(r);
+                  });
+                  mock_image_ctx.image_ctx->op_work_queue->queue(ctx, r);
+                }));
   }
 
-  void expect_invalidate_cache(MockImageCtx &mock_image_ctx, int r) {
-    EXPECT_CALL(mock_image_ctx, invalidate_cache(_))
-                  .WillOnce(CompleteContext(r, NULL));
+  void expect_invalidate_cache(MockImageCtx &mock_image_ctx,
+                               int r) {
+    EXPECT_CALL(*mock_image_ctx.io_object_dispatcher, invalidate_cache(_))
+                   .WillOnce(CompleteContext(r, mock_image_ctx.image_ctx->op_work_queue));
     expect_op_work_queue(mock_image_ctx);
   }
 
@@ -205,7 +253,8 @@ TEST_F(TestMockOperationResizeRequest, ShrinkSuccess) {
   expect_unblock_writes(mock_image_ctx);
 
   MockTrimRequest mock_trim_request;
-  expect_flush_cache(mock_image_ctx, 0);
+  auto mock_io_image_dispatch_spec = new MockIoImageDispatchSpec();
+  expect_flush_cache(mock_image_ctx, *mock_io_image_dispatch_spec, 0);
   expect_invalidate_cache(mock_image_ctx, 0);
   expect_trim(mock_image_ctx, mock_trim_request, 0);
   expect_block_writes(mock_image_ctx, 0);
@@ -267,7 +316,8 @@ TEST_F(TestMockOperationResizeRequest, TrimError) {
   expect_unblock_writes(mock_image_ctx);
 
   MockTrimRequest mock_trim_request;
-  expect_flush_cache(mock_image_ctx, 0);
+  auto mock_io_image_dispatch_spec = new MockIoImageDispatchSpec();
+  expect_flush_cache(mock_image_ctx, *mock_io_image_dispatch_spec, 0);
   expect_invalidate_cache(mock_image_ctx, -EBUSY);
   expect_trim(mock_image_ctx, mock_trim_request, -EINVAL);
   expect_commit_op_event(mock_image_ctx, -EINVAL);
@@ -277,6 +327,7 @@ TEST_F(TestMockOperationResizeRequest, TrimError) {
 TEST_F(TestMockOperationResizeRequest, FlushCacheError) {
   librbd::ImageCtx *ictx;
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
+  REQUIRE(ictx->cache);
 
   MockImageCtx mock_image_ctx(*ictx);
   MockExclusiveLock mock_exclusive_lock;
@@ -291,7 +342,8 @@ TEST_F(TestMockOperationResizeRequest, FlushCacheError) {
   expect_unblock_writes(mock_image_ctx);
 
   MockTrimRequest mock_trim_request;
-  expect_flush_cache(mock_image_ctx, -EINVAL);
+  auto mock_io_image_dispatch_spec = new MockIoImageDispatchSpec();
+  expect_flush_cache(mock_image_ctx, *mock_io_image_dispatch_spec, -EINVAL);
   expect_commit_op_event(mock_image_ctx, -EINVAL);
   ASSERT_EQ(-EINVAL, when_resize(mock_image_ctx, ictx->size / 2, true, 0, false));
 }
@@ -299,6 +351,7 @@ TEST_F(TestMockOperationResizeRequest, FlushCacheError) {
 TEST_F(TestMockOperationResizeRequest, InvalidateCacheError) {
   librbd::ImageCtx *ictx;
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
+  REQUIRE(ictx->cache);
 
   MockImageCtx mock_image_ctx(*ictx);
   MockExclusiveLock mock_exclusive_lock;
@@ -313,7 +366,8 @@ TEST_F(TestMockOperationResizeRequest, InvalidateCacheError) {
   expect_unblock_writes(mock_image_ctx);
 
   MockTrimRequest mock_trim_request;
-  expect_flush_cache(mock_image_ctx, 0);
+  auto mock_io_image_dispatch_spec = new MockIoImageDispatchSpec();
+  expect_flush_cache(mock_image_ctx, *mock_io_image_dispatch_spec, 0);
   expect_invalidate_cache(mock_image_ctx, -EINVAL);
   expect_commit_op_event(mock_image_ctx, -EINVAL);
   ASSERT_EQ(-EINVAL, when_resize(mock_image_ctx, ictx->size / 2, true, 0, false));

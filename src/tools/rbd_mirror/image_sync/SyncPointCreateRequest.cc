@@ -3,6 +3,7 @@
 
 #include "SyncPointCreateRequest.h"
 #include "include/uuid.h"
+#include "common/debug.h"
 #include "common/errno.h"
 #include "journal/Journaler.h"
 #include "librbd/ImageCtx.h"
@@ -10,6 +11,7 @@
 #include "librbd/Operations.h"
 #include "librbd/Utils.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
 #undef dout_prefix
 #define dout_prefix *_dout << "rbd::mirror::image_sync::SyncPointCreateRequest: " \
@@ -36,7 +38,7 @@ SyncPointCreateRequest<I>::SyncPointCreateRequest(I *remote_image_ctx,
   : m_remote_image_ctx(remote_image_ctx), m_mirror_uuid(mirror_uuid),
     m_journaler(journaler), m_client_meta(client_meta), m_on_finish(on_finish),
     m_client_meta_copy(*client_meta) {
-  assert(m_client_meta->sync_points.size() < 2);
+  ceph_assert(m_client_meta->sync_points.size() < 2);
 
   // initialize the updated client meta with the new sync point
   m_client_meta_copy.sync_points.emplace_back();
@@ -64,7 +66,7 @@ void SyncPointCreateRequest<I>::send_update_client() {
 
   bufferlist client_data_bl;
   librbd::journal::ClientData client_data(m_client_meta_copy);
-  ::encode(client_data, client_data_bl);
+  encode(client_data, client_data_bl);
 
   Context *ctx = create_context_callback<
     SyncPointCreateRequest<I>, &SyncPointCreateRequest<I>::handle_update_client>(
@@ -122,7 +124,7 @@ void SyncPointCreateRequest<I>::send_create_snap() {
     SyncPointCreateRequest<I>, &SyncPointCreateRequest<I>::handle_create_snap>(
       this);
   m_remote_image_ctx->operations->snap_create(
-    sync_point.snap_name.c_str(), cls::rbd::UserSnapshotNamespace(), ctx);
+    cls::rbd::UserSnapshotNamespace(), sync_point.snap_name.c_str(), ctx);
 }
 
 template <typename I>

@@ -20,8 +20,10 @@
 #include "mds/FSMap.h"
 #include "include/ceph_features.h"
 
-class MFSMap : public Message {
- public:
+class MFSMap : public MessageInstance<MFSMap> {
+public:
+  friend factory;
+
   epoch_t epoch;
   bufferlist encoded;
 
@@ -29,32 +31,33 @@ class MFSMap : public Message {
   const FSMap & get_fsmap() {return fsmap;}
 
   MFSMap() : 
-    Message(CEPH_MSG_FS_MAP), epoch(0) {}
+    MessageInstance(CEPH_MSG_FS_MAP), epoch(0) {}
   MFSMap(const uuid_d &f, const FSMap &fsmap_) :
-    Message(CEPH_MSG_FS_MAP), epoch(fsmap_.get_epoch())
+    MessageInstance(CEPH_MSG_FS_MAP), epoch(fsmap_.get_epoch())
   {
     fsmap = fsmap_;
   }
 private:
   FSMap fsmap;
 
-  ~MFSMap() {}
+  ~MFSMap() override {}
 
 public:
-  const char *get_type_name() const { return "fsmap"; }
-  void print(ostream& out) const {
+  const char *get_type_name() const override { return "fsmap"; }
+  void print(ostream& out) const override {
     out << "fsmap(e " << epoch << ")";
   }
 
   // marshalling
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
-    ::decode(epoch, p);
-    ::decode(fsmap, p);
+  void decode_payload() override {
+    auto p = payload.cbegin();
+    decode(epoch, p);
+    decode(fsmap, p);
   }
-  void encode_payload(uint64_t features) {
-    ::encode(epoch, payload);
-    ::encode(fsmap, payload, features);
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
+    encode(epoch, payload);
+    encode(fsmap, payload, features);
   }
 };
 

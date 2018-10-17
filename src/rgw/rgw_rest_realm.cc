@@ -6,7 +6,7 @@
 #include "rgw_rest_s3.h"
 #include "rgw_rest_config.h"
 
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -26,9 +26,7 @@ class RGWOp_Period_Base : public RGWRESTOp {
 // reply with the period object on success
 void RGWOp_Period_Base::send_response()
 {
-  s->err.message = error_stream.str();
-
-  set_req_state_err(s, http_ret);
+  set_req_state_err(s, http_ret, error_stream.str());
   dump_errno(s);
 
   if (http_ret < 0) {
@@ -49,7 +47,7 @@ void RGWOp_Period_Base::send_response()
 class RGWOp_Period_Get : public RGWOp_Period_Base {
  public:
   void execute() override;
-  const string name() override { return "get_period"; }
+  const char* name() const override { return "get_period"; }
 };
 
 void RGWOp_Period_Get::execute()
@@ -73,7 +71,7 @@ void RGWOp_Period_Get::execute()
 class RGWOp_Period_Post : public RGWOp_Period_Base {
  public:
   void execute() override;
-  const string name() override { return "post_period"; }
+  const char* name() const override { return "post_period"; }
 };
 
 void RGWOp_Period_Post::execute()
@@ -84,9 +82,9 @@ void RGWOp_Period_Post::execute()
   period.init(cct, store, false);
 
   // decode the period from input
-#define PERIOD_MAX_LEN 4096
+  const auto max_size = cct->_conf->rgw_max_put_param_size;
   bool empty;
-  http_ret = rgw_rest_get_json_input(cct, s, period, PERIOD_MAX_LEN, &empty);
+  http_ret = rgw_rest_get_json_input(cct, s, period, max_size, &empty);
   if (http_ret < 0) {
     lderr(cct) << "failed to decode period" << dendl;
     return;
@@ -142,6 +140,19 @@ void RGWOp_Period_Post::execute()
     lderr(cct) << "failed to store period " << period.get_id() << dendl;
     return;
   }
+  // set as latest epoch
+  http_ret = period.update_latest_epoch(period.get_epoch());
+  if (http_ret == -EEXIST) {
+    // already have this epoch (or a more recent one)
+    ldout(cct, 4) << "already have epoch >= " << period.get_epoch()
+        << " for period " << period.get_id() << dendl;
+    http_ret = 0;
+    return;
+  }
+  if (http_ret < 0) {
+    lderr(cct) << "failed to set latest epoch" << dendl;
+    return;
+  }
 
   // decide whether we can set_current_period() or set_latest_epoch()
   if (period.get_id() != current_period.get_id()) {
@@ -192,22 +203,9 @@ void RGWOp_Period_Post::execute()
     realm.notify_new_period(period);
     return;
   }
-
-  if (period.get_epoch() <= current_period.get_epoch()) {
-    lderr(cct) << "period epoch " << period.get_epoch() << " is not newer "
-        "than current epoch " << current_period.get_epoch()
-        << ", discarding update" << dendl;
-    return;
-  }
-  // set as latest epoch
-  http_ret = period.set_latest_epoch(period.get_epoch());
-  if (http_ret < 0) {
-    lderr(cct) << "failed to set latest epoch" << dendl;
-    return;
-  }
   // reflect the period into our local objects
-  http_ret  = period.reflect();
-  if (http_ret  < 0) {
+  http_ret = period.reflect();
+  if (http_ret < 0) {
     lderr(cct) << "failed to update local objects: "
         << cpp_strerror(-http_ret) << dendl;
     return;
@@ -222,6 +220,8 @@ void RGWOp_Period_Post::execute()
 
 class RGWHandler_Period : public RGWHandler_Auth_S3 {
  protected:
+  using RGWHandler_Auth_S3::RGWHandler_Auth_S3;
+
   RGWOp *op_get() override { return new RGWOp_Period_Get; }
   RGWOp *op_post() override { return new RGWOp_Period_Post; }
 };
@@ -229,8 +229,9 @@ class RGWHandler_Period : public RGWHandler_Auth_S3 {
 class RGWRESTMgr_Period : public RGWRESTMgr {
  public:
   RGWHandler_REST* get_handler(struct req_state*,
+                               const rgw::auth::StrategyRegistry& auth_registry,
                                const std::string&) override {
-    return new RGWHandler_Period;
+    return new RGWHandler_Period(auth_registry);
   }
 };
 
@@ -242,7 +243,7 @@ public:
   int verify_permission() override { return 0; }
   void execute() override;
   void send_response() override;
-  const string name() { return "get_realm"; }
+  const char* name() const override { return "get_realm"; }
 };
 
 void RGWOp_Realm_Get::execute()
@@ -277,7 +278,8 @@ void RGWOp_Realm_Get::send_response()
 
 class RGWHandler_Realm : public RGWHandler_Auth_S3 {
 protected:
-  RGWOp *op_get() { return new RGWOp_Realm_Get; }
+  using RGWHandler_Auth_S3::RGWHandler_Auth_S3;
+  RGWOp *op_get() override { return new RGWOp_Realm_Get; }
 };
 
 RGWRESTMgr_Realm::RGWRESTMgr_Realm()
@@ -286,8 +288,10 @@ RGWRESTMgr_Realm::RGWRESTMgr_Realm()
   register_resource("period", new RGWRESTMgr_Period);
 }
 
-RGWHandler_REST* RGWRESTMgr_Realm::get_handler(struct req_state*,
-                                               const std::string&)
+RGWHandler_REST*
+RGWRESTMgr_Realm::get_handler(struct req_state*,
+                              const rgw::auth::StrategyRegistry& auth_registry,
+                              const std::string&)
 {
-  return new RGWHandler_Realm;
+  return new RGWHandler_Realm(auth_registry);
 }

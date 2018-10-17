@@ -17,27 +17,30 @@
 
 #include "osd/osd_types.h"
 
-class MPGStatsAck : public Message {
+class MPGStatsAck : public MessageInstance<MPGStatsAck> {
 public:
+  friend factory;
+
   map<pg_t,pair<version_t,epoch_t> > pg_stat;
   
-  MPGStatsAck() : Message(MSG_PGSTATSACK) {}
+  MPGStatsAck() : MessageInstance(MSG_PGSTATSACK) {}
 
 private:
-  ~MPGStatsAck() {}
+  ~MPGStatsAck() override {}
 
 public:
-  const char *get_type_name() const { return "pg_stats_ack"; }
-  void print(ostream& out) const {
+  const char *get_type_name() const override { return "pg_stats_ack"; }
+  void print(ostream& out) const override {
     out << "pg_stats_ack(" << pg_stat.size() << " pgs tid " << get_tid() << ")";
   }
 
-  void encode_payload(uint64_t features) {
-    ::encode(pg_stat, payload);
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
+    encode(pg_stat, payload);
   }
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
-    ::decode(pg_stat, p);
+  void decode_payload() override {
+    auto p = payload.cbegin();
+    decode(pg_stat, p);
   }
 };
 

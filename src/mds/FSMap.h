@@ -16,18 +16,16 @@
 #ifndef CEPH_FSMAP_H
 #define CEPH_FSMAP_H
 
+#include <map>
+#include <set>
+#include <string>
+#include <string_view>
+
 #include <errno.h>
 
 #include "include/types.h"
 #include "common/Clock.h"
-#include "msg/Message.h"
 #include "mds/MDSMap.h"
-
-#include <set>
-#include <map>
-#include <string>
-
-#include "common/config.h"
 
 #include "include/CompatSet.h"
 #include "include/ceph_features.h"
@@ -35,15 +33,7 @@
 #include "mds/mdstypes.h"
 
 class CephContext;
-
-#define MDS_FEATURE_INCOMPAT_BASE CompatSet::Feature(1, "base v0.20")
-#define MDS_FEATURE_INCOMPAT_CLIENTRANGES CompatSet::Feature(2, "client writeable ranges")
-#define MDS_FEATURE_INCOMPAT_FILELAYOUT CompatSet::Feature(3, "default file layouts on dirs")
-#define MDS_FEATURE_INCOMPAT_DIRINODE CompatSet::Feature(4, "dir inode in separate object")
-#define MDS_FEATURE_INCOMPAT_ENCODING CompatSet::Feature(5, "mds uses versioned encoding")
-#define MDS_FEATURE_INCOMPAT_OMAPDIRFRAG CompatSet::Feature(6, "dirfrag is stored in omap")
-#define MDS_FEATURE_INCOMPAT_INLINE CompatSet::Feature(7, "mds uses inline data")
-#define MDS_FEATURE_INCOMPAT_NOANCHOR CompatSet::Feature(8, "no anchor table")
+class health_check_map_t;
 
 #define MDS_FS_NAME_DEFAULT "cephfs"
 
@@ -53,18 +43,9 @@ class CephContext;
  */
 class Filesystem
 {
-  public:
-  fs_cluster_id_t fscid;
-  MDSMap mds_map;
-
+public:
   void encode(bufferlist& bl, uint64_t features) const;
-  void decode(bufferlist::iterator& p);
-
-  Filesystem()
-    :
-      fscid(FS_CLUSTER_ID_NONE)
-  {
-  }
+  void decode(bufferlist::const_iterator& p);
 
   void dump(Formatter *f) const;
   void print(std::ostream& out) const;
@@ -85,17 +66,20 @@ class Filesystem
 
     return false;
   }
+
+  fs_cluster_id_t fscid = FS_CLUSTER_ID_NONE;
+  MDSMap mds_map;
 };
 WRITE_CLASS_ENCODER_FEATURES(Filesystem)
 
 class FSMap {
 protected:
-  epoch_t epoch;
-  uint64_t next_filesystem_id;
-  fs_cluster_id_t legacy_client_fscid;
+  epoch_t epoch = 0;
+  uint64_t next_filesystem_id = FS_CLUSTER_ID_ANONYMOUS + 1;
+  fs_cluster_id_t legacy_client_fscid = FS_CLUSTER_ID_NONE;
   CompatSet compat;
-  bool enable_multiple;
-  bool ever_enabled_multiple; // < the cluster had multiple MDSes enabled once
+  bool enable_multiple = false;
+  bool ever_enabled_multiple = false; // < the cluster had multiple MDSes enabled once
 
   std::map<fs_cluster_id_t, std::shared_ptr<Filesystem> > filesystems;
 
@@ -110,14 +94,9 @@ protected:
 public:
 
   friend class MDSMonitor;
+  friend class PaxosFSMap;
 
-  FSMap() 
-    : epoch(0),
-      next_filesystem_id(FS_CLUSTER_ID_ANONYMOUS + 1),
-      legacy_client_fscid(FS_CLUSTER_ID_NONE),
-      compat(get_mdsmap_compat_set_default()),
-      enable_multiple(false), ever_enabled_multiple(false)
-  { }
+  FSMap() : compat(MDSMap::get_compat_set_default()) {}
 
   FSMap(const FSMap &rhs)
     :
@@ -131,6 +110,7 @@ public:
       standby_daemons(rhs.standby_daemons),
       standby_epochs(rhs.standby_epochs)
   {
+    filesystems.clear();
     for (const auto &i : rhs.filesystems) {
       const auto &fs = i.second;
       filesystems[fs->fscid] = std::make_shared<Filesystem>(*fs);
@@ -148,6 +128,7 @@ public:
     standby_daemons = rhs.standby_daemons;
     standby_epochs = rhs.standby_epochs;
 
+    filesystems.clear();
     for (const auto &i : rhs.filesystems) {
       const auto &fs = i.second;
       filesystems[fs->fscid] = std::make_shared<Filesystem>(*fs);
@@ -169,6 +150,17 @@ public:
   bool get_enable_multiple() const
   {
     return enable_multiple;
+  }
+
+  void set_legacy_client_fscid(fs_cluster_id_t fscid)
+  {
+    ceph_assert(fscid == FS_CLUSTER_ID_NONE || filesystems.count(fscid));
+    legacy_client_fscid = fscid;
+  }
+
+  fs_cluster_id_t get_legacy_client_fscid() const
+  {
+    return legacy_client_fscid;
   }
 
   /**
@@ -194,7 +186,7 @@ public:
   /**
    * Resolve daemon name to GID
    */
-  mds_gid_t find_mds_gid_by_name(const std::string& s) const
+  mds_gid_t find_mds_gid_by_name(std::string_view s) const
   {
     const auto info = get_mds_info();
     for (const auto &p : info) {
@@ -208,7 +200,7 @@ public:
   /**
    * Resolve daemon name to status
    */
-  const MDSMap::mds_info_t* find_by_name(const std::string& name) const
+  const MDSMap::mds_info_t* find_by_name(std::string_view name) const
   {
     std::map<mds_gid_t, MDSMap::mds_info_t> result;
     for (const auto &i : standby_daemons) {
@@ -293,6 +285,33 @@ public:
   bool undamaged(const fs_cluster_id_t fscid, const mds_rank_t rank);
 
   /**
+   * Initialize a Filesystem and assign a fscid.  Update legacy_client_fscid
+   * to point to the new filesystem if it's the only one.
+   *
+   * Caller must already have validated all arguments vs. the existing
+   * FSMap and OSDMap contents.
+   */
+  std::shared_ptr<Filesystem> create_filesystem(
+      std::string_view name, int64_t metadata_pool,
+      int64_t data_pool, uint64_t features);
+
+  /**
+   * Remove the filesystem (it must exist).  Caller should already
+   * have failed out any MDSs that were assigned to the filesystem.
+   */
+  void erase_filesystem(fs_cluster_id_t fscid)
+  {
+    filesystems.erase(fscid);
+  }
+
+  /**
+   * Reset all the state information (not configuration information)
+   * in a particular filesystem.  Caller must have verified that
+   * the filesystem already exists.
+   */
+  void reset_filesystem(fs_cluster_id_t fscid);
+
+  /**
    * Mutator helper for Filesystem objects: expose a non-const
    * Filesystem pointer to `fn` and update epochs appropriately.
    */
@@ -316,7 +335,7 @@ public:
     if (mds_roles.at(who) == FS_CLUSTER_ID_NONE) {
       auto &info = standby_daemons.at(who);
       fn(&info);
-      assert(info.state == MDSMap::STATE_STANDBY);
+      ceph_assert(info.state == MDSMap::STATE_STANDBY);
       standby_epochs[who] = epoch;
     } else {
       const auto &fs = filesystems[mds_roles.at(who)];
@@ -372,7 +391,7 @@ public:
   /**
    * A daemon has informed us of its offload targets
    */
-  void update_export_targets(mds_gid_t who, const std::set<mds_rank_t> targets)
+  void update_export_targets(mds_gid_t who, const std::set<mds_rank_t> &targets)
   {
     auto fscid = mds_roles.at(who);
     modify_filesystem(fscid, [who, &targets](std::shared_ptr<Filesystem> fs) {
@@ -386,8 +405,9 @@ public:
   size_t filesystem_count() const {return filesystems.size();}
   bool filesystem_exists(fs_cluster_id_t fscid) const {return filesystems.count(fscid) > 0;}
   std::shared_ptr<const Filesystem> get_filesystem(fs_cluster_id_t fscid) const {return std::const_pointer_cast<const Filesystem>(filesystems.at(fscid));}
+  std::shared_ptr<Filesystem> get_filesystem(fs_cluster_id_t fscid) {return filesystems.at(fscid);}
   std::shared_ptr<const Filesystem> get_filesystem(void) const {return std::const_pointer_cast<const Filesystem>(filesystems.begin()->second);}
-  std::shared_ptr<const Filesystem> get_filesystem(const std::string &name) const
+  std::shared_ptr<const Filesystem> get_filesystem(std::string_view name) const
   {
     for (const auto &i : filesystems) {
       if (i.second->mds_map.fs_name == name) {
@@ -396,14 +416,22 @@ public:
     }
     return nullptr;
   }
+  std::list<std::shared_ptr<const Filesystem> > get_filesystems(void) const
+    {
+      std::list<std::shared_ptr<const Filesystem> > ret;
+      for (const auto &i : filesystems) {
+	ret.push_back(std::const_pointer_cast<const Filesystem>(i.second));
+      }
+      return ret;
+    }
 
   int parse_filesystem(
-      std::string const &ns_str,
+      std::string_view ns_str,
       std::shared_ptr<const Filesystem> *result
       ) const;
 
   int parse_role(
-      const std::string &role_str,
+      std::string_view role_str,
       mds_role_t *role,
       std::ostream &ss) const;
 
@@ -420,15 +448,19 @@ public:
     return false;
   }
 
-  mds_gid_t find_standby_for(mds_role_t mds, const std::string& name) const;
+  mds_gid_t find_standby_for(mds_role_t mds, std::string_view name) const;
 
-  mds_gid_t find_unused(fs_cluster_id_t fscid, bool force_standby_active) const;
+  mds_gid_t find_unused_for(mds_role_t mds, bool force_standby_active) const;
 
-  mds_gid_t find_replacement_for(mds_role_t mds, const std::string& name,
+  mds_gid_t find_replacement_for(mds_role_t mds, std::string_view name,
                                  bool force_standby_active) const;
 
   void get_health(list<pair<health_status_t,std::string> >& summary,
 		  list<pair<health_status_t,std::string> > *detail) const;
+
+  void get_health_checks(health_check_map_t *checks) const;
+
+  bool check_health(void);
 
   /**
    * Assert that the FSMap, Filesystem, MDSMap, mds_info_t relations are
@@ -437,11 +469,12 @@ public:
   void sanity() const;
 
   void encode(bufferlist& bl, uint64_t features) const;
-  void decode(bufferlist::iterator& p);
+  void decode(bufferlist::const_iterator& p);
   void decode(bufferlist& bl) {
-    bufferlist::iterator p = bl.begin();
+    auto p = bl.cbegin();
     decode(p);
   }
+  void sanitize(const std::function<bool(int64_t pool)>& pool_exists);
 
   void print(ostream& out) const;
   void print_summary(Formatter *f, ostream *out) const;

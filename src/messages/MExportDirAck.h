@@ -16,36 +16,40 @@
 #define CEPH_MEXPORTDIRACK_H
 
 #include "MExportDir.h"
+#include "msg/Message.h"
 
-class MExportDirAck : public Message {
+class MExportDirAck : public MessageInstance<MExportDirAck> {
 public:
+  friend factory;
+
   dirfrag_t dirfrag;
   bufferlist imported_caps;
 
-  dirfrag_t get_dirfrag() { return dirfrag; }
+  dirfrag_t get_dirfrag() const { return dirfrag; }
   
-  MExportDirAck() : Message(MSG_MDS_EXPORTDIRACK) {}
+protected:
+  MExportDirAck() : MessageInstance(MSG_MDS_EXPORTDIRACK) {}
   MExportDirAck(dirfrag_t df, uint64_t tid) :
-    Message(MSG_MDS_EXPORTDIRACK), dirfrag(df) {
+    MessageInstance(MSG_MDS_EXPORTDIRACK), dirfrag(df) {
     set_tid(tid);
   }
-private:
-  ~MExportDirAck() {}
+  ~MExportDirAck() override {}
 
 public:
-  const char *get_type_name() const { return "ExAck"; }
-    void print(ostream& o) const {
+  const char *get_type_name() const override { return "ExAck"; }
+    void print(ostream& o) const override {
     o << "export_ack(" << dirfrag << ")";
   }
 
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
-    ::decode(dirfrag, p);
-    ::decode(imported_caps, p);
+  void decode_payload() override {
+    auto p = payload.cbegin();
+    decode(dirfrag, p);
+    decode(imported_caps, p);
   }
-  void encode_payload(uint64_t features) {
-    ::encode(dirfrag, payload);
-    ::encode(imported_caps, payload);
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
+    encode(dirfrag, payload);
+    encode(imported_caps, payload);
   }
 
 };

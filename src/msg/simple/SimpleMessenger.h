@@ -15,25 +15,25 @@
 #ifndef CEPH_SIMPLEMESSENGER_H
 #define CEPH_SIMPLEMESSENGER_H
 
+#include <list>
+#include <map>
+
 #include "include/types.h"
 #include "include/xlist.h"
 
-#include <list>
-#include <map>
-using namespace std;
 #include "include/unordered_map.h"
 #include "include/unordered_set.h"
 
 #include "common/Mutex.h"
-#include "include/atomic.h"
-#include "include/Spinlock.h"
 #include "common/Cond.h"
 #include "common/Thread.h"
 #include "common/Throttle.h"
 
+#include "include/spinlock.h"
+
 #include "msg/SimplePolicyMessenger.h"
 #include "msg/Message.h"
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 #include "msg/DispatchQueue.h"
 #include "Pipe.h"
@@ -88,18 +88,20 @@ public:
    * Destroy the SimpleMessenger. Pretty simple since all the work is done
    * elsewhere.
    */
-  virtual ~SimpleMessenger();
+  ~SimpleMessenger() override;
 
   /** @defgroup Accessors
    * @{
    */
-  void set_addr_unknowns(const entity_addr_t& addr) override;
+  bool set_addr_unknowns(const entity_addrvec_t& addr) override;
+  void set_addrs(const entity_addrvec_t &addr) override;
+  void set_myaddrs(const entity_addrvec_t& a) override;
 
-  int get_dispatch_queue_len() {
+  int get_dispatch_queue_len() override {
     return dispatch_queue.get_queue_len();
   }
 
-  double get_dispatch_queue_max_age(utime_t now) {
+  double get_dispatch_queue_max_age(utime_t now) override {
     return dispatch_queue.get_max_age(now);
   }
   /** @} Accessors */
@@ -108,13 +110,14 @@ public:
    * @defgroup Configuration functions
    * @{
    */
-  void set_cluster_protocol(int p) {
-    assert(!started && !did_bind);
+  void set_cluster_protocol(int p) override {
+    ceph_assert(!started && !did_bind);
     cluster_protocol = p;
   }
 
-  int bind(const entity_addr_t& bind_addr);
-  int rebind(const set<int>& avoid_ports);
+  int bind(const entity_addr_t& bind_addr) override;
+  int rebind(const set<int>& avoid_ports) override;
+  int client_bind(const entity_addr_t& bind_addr) override;
 
   /** @} Configuration functions */
 
@@ -122,9 +125,9 @@ public:
    * @defgroup Startup/Shutdown
    * @{
    */
-  virtual int start();
-  virtual void wait();
-  virtual int shutdown();
+  int start() override;
+  void wait() override;
+  int shutdown() override;
 
   /** @} // Startup/Shutdown */
 
@@ -132,8 +135,16 @@ public:
    * @defgroup Messaging
    * @{
    */
-  virtual int send_message(Message *m, const entity_inst_t& dest) {
+  int send_message(Message *m, const entity_inst_t& dest) override {
     return _send_message(m, dest);
+  }
+  int send_to(
+    Message *m,
+    int type,
+    const entity_addrvec_t& addr) override {
+    // temporary
+    return send_message(m, entity_inst_t(entity_name_t(type, -1),
+					 addr.legacy_addr()));
   }
 
   int send_message(Message *m, Connection *con) {
@@ -146,13 +157,13 @@ public:
    * @defgroup Connection Management
    * @{
    */
-  virtual ConnectionRef get_connection(const entity_inst_t& dest);
-  virtual ConnectionRef get_loopback_connection();
+  ConnectionRef connect_to(int type, const entity_addrvec_t& addrs) override;
+  ConnectionRef get_loopback_connection() override;
   int send_keepalive(Connection *con);
-  virtual void mark_down(const entity_addr_t& addr);
+  void mark_down(const entity_addr_t& addr) override;
   void mark_down(Connection *con);
   void mark_disposable(Connection *con);
-  virtual void mark_down_all();
+  void mark_down_all() override;
   /** @} // Connection Management */
 protected:
   /**
@@ -162,7 +173,7 @@ protected:
   /**
    * Start up the DispatchQueue thread once we have somebody to dispatch to.
    */
-  virtual void ready();
+  void ready() override;
   /** @} // Messenger Interfaces */
 private:
   /**
@@ -192,7 +203,7 @@ private:
     SimpleMessenger *msgr;
   public:
     explicit ReaperThread(SimpleMessenger *m) : msgr(m) {}
-    void *entry() {
+    void *entry() override {
       msgr->reaper_entry();
       return 0;
     }
@@ -282,7 +293,9 @@ private:
   /// counter for the global seq our connection protocol uses
   __u32 global_seq;
   /// lock to protect the global_seq
-  ceph_spinlock_t global_seq_lock;
+  ceph::spinlock global_seq_lock;
+
+  entity_addr_t my_addr;
 
   /**
    * hash map of addresses to Pipes
@@ -292,7 +305,7 @@ private:
    */
   ceph::unordered_map<entity_addr_t, Pipe*> rank_pipe;
   /**
-   * list of pipes are in teh process of accepting
+   * list of pipes are in the process of accepting
    *
    * These are not yet in the rank_pipe map.
    */
@@ -321,7 +334,7 @@ private:
     if (p == rank_pipe.end())
       return NULL;
     // see lock cribbing in Pipe::fault()
-    if (p->second->state_closed.read())
+    if (p->second->state_closed)
       return NULL;
     return p->second;
   }
@@ -339,15 +352,6 @@ public:
    */
 
   /**
-   * This wraps ms_deliver_get_authorizer. We use it for Pipe.
-   */
-  AuthAuthorizer *get_authorizer(int peer_type, bool force_new);
-  /**
-   * This wraps ms_deliver_verify_authorizer; we use it for Pipe.
-   */
-  bool verify_authorizer(Connection *con, int peer_type, int protocol, bufferlist& auth, bufferlist& auth_reply,
-                         bool& isvalid,CryptoKey& session_key);
-  /**
    * Increment the global sequence for this SimpleMessenger and return it.
    * This is for the connect protocol, although it doesn't hurt if somebody
    * else calls it.
@@ -355,11 +359,12 @@ public:
    * @return a global sequence ID that nobody else has seen.
    */
   __u32 get_global_seq(__u32 old=0) {
-    ceph_spin_lock(&global_seq_lock);
+    std::lock_guard<decltype(global_seq_lock)> lg(global_seq_lock);
+
     if (old > global_seq)
       global_seq = old;
     __u32 ret = ++global_seq;
-    ceph_spin_unlock(&global_seq_lock);
+
     return ret;
   }
   /**

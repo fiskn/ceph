@@ -28,6 +28,7 @@
 #include "common/debug.h"
 #include "global/global_init.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
 namespace {
@@ -77,7 +78,7 @@ namespace {
     std::vector<ZPage*> pages;
     struct iovec* iovs;
 
-    ZPageSet(int n) {
+    explicit ZPageSet(int n) {
       pages.reserve(n);
       iovs = (struct iovec*) calloc(n, sizeof(struct iovec));
       for (int page_ix = 0; page_ix < n; ++page_ix) {
@@ -178,8 +179,8 @@ TEST(LibRGW, INIT) {
 }
 
 TEST(LibRGW, MOUNT) {
-  int ret = rgw_mount(rgw, uid.c_str(), access_key.c_str(), secret_key.c_str(),
-		      &fs, RGW_MOUNT_FLAG_NONE);
+  int ret = rgw_mount2(rgw, uid.c_str(), access_key.c_str(), secret_key.c_str(),
+                       "/", &fs, RGW_MOUNT_FLAG_NONE);
   ASSERT_EQ(ret, 0);
   ASSERT_NE(fs, nullptr);
 }
@@ -191,7 +192,8 @@ TEST(LibRGW, LOOKUP_BUCKET) {
 }
 
 extern "C" {
-  static bool r2_cb(const char* name, void *arg, uint64_t offset) {
+  static bool r2_cb(const char* name, void *arg, uint64_t offset,
+		    uint32_t flags) {
     // don't need arg--it would point to fids
     fids.push_back(fid_type(name, offset, nullptr));
     return true; /* XXX ? */
@@ -469,7 +471,7 @@ int main(int argc, char *argv[])
     }
   }
 
-  /* dont accidentally run as anonymous */
+  /* don't accidentally run as anonymous */
   if ((access_key == "") ||
       (secret_key == "")) {
     std::cout << argv[0] << " no AWS credentials, exiting" << std::endl;

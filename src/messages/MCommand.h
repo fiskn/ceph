@@ -19,23 +19,25 @@
 
 #include "msg/Message.h"
 
-class MCommand : public Message {
- public:
+class MCommand : public MessageInstance<MCommand> {
+public:
+  friend factory;
+
   uuid_d fsid;
   std::vector<string> cmd;
 
   MCommand()
-    : Message(MSG_MON_COMMAND) {}
+    : MessageInstance(MSG_COMMAND) {}
   MCommand(const uuid_d &f)
-    : Message(MSG_COMMAND),
+    : MessageInstance(MSG_COMMAND),
       fsid(f) { }
 
 private:
-  ~MCommand() {}
+  ~MCommand() override {}
 
 public:  
-  const char *get_type_name() const { return "command"; }
-  void print(ostream& o) const {
+  const char *get_type_name() const override { return "command"; }
+  void print(ostream& o) const override {
     o << "command(tid " << get_tid() << ": ";
     for (unsigned i=0; i<cmd.size(); i++) {
       if (i) o << ' ';
@@ -44,14 +46,15 @@ public:
     o << ")";
   }
   
-  void encode_payload(uint64_t features) {
-    ::encode(fsid, payload);
-    ::encode(cmd, payload);
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
+    encode(fsid, payload);
+    encode(cmd, payload);
   }
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
-    ::decode(fsid, p);
-    ::decode(cmd, p);
+  void decode_payload() override {
+    auto p = payload.cbegin();
+    decode(fsid, p);
+    decode(cmd, p);
   }
 };
 

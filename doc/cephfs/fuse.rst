@@ -1,8 +1,7 @@
-=========================
- Mount Ceph FS as a FUSE
-=========================
+=======================
+Mount CephFS using FUSE
+=======================
 
-For Ceph version 0.55 and later, ``cephx`` authentication is on by default.
 Before mounting a Ceph File System in User Space (FUSE), ensure that the client
 host has a copy of the Ceph configuration file and a keyring with CAPS for the
 Ceph metadata server.
@@ -27,8 +26,12 @@ For additional details on ``cephx`` configuration, see
 To mount the Ceph file system as a FUSE, you may use the ``ceph-fuse`` command.
 For example::
 
-	sudo mkdir /home/usernname/cephfs
+	sudo mkdir /home/username/cephfs
 	sudo ceph-fuse -m 192.168.0.1:6789 /home/username/cephfs
+
+If you have more than one filesystem, specify which one to mount using
+the ``--client_mds_namespace`` command line argument, or add a
+``client_mds_namespace`` setting to your ``ceph.conf``.
 
 See `ceph-fuse`_ for additional details.
 
@@ -45,5 +48,5 @@ A persistent mount point can be setup via::
 	sudo systemctl enable ceph-fuse@/mnt.service
 
 .. _ceph-fuse: ../../man/8/ceph-fuse/
-.. _fstab: ./fstab
+.. _fstab: ../fstab/#fuse
 .. _CEPHX Config Reference: ../../rados/configuration/auth-config-ref

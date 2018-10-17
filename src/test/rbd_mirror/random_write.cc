@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
 #undef dout_prefix
 #define dout_prefix *_dout << "random-write: "
@@ -71,7 +72,7 @@ struct rbd_bencher {
     while (in_flight > max) {
       utime_t dur;
       dur.set_from_double(.2);
-      cond.WaitInterval(g_ceph_context, lock, dur);
+      cond.WaitInterval(lock, dur);
     }
   }
 
@@ -104,7 +105,7 @@ void write_image(librbd::Image &image) {
 
   uint64_t size = 0;
   image.size(&size);
-  assert(size != 0);
+  ceph_assert(size != 0);
 
   vector<uint64_t> thread_offset;
   uint64_t i;
@@ -153,17 +154,18 @@ int main(int argc, const char **argv)
 {
   std::vector<const char*> args;
   argv_to_vec(argc, argv, args);
-  env_to_vec(args);
+  if (args.empty()) {
+    cerr << argv[0] << ": -h or --help for usage" << std::endl;
+    exit(1);
+  }
+  if (ceph_argparse_need_usage(args)) {
+    usage();
+    exit(0);
+  }
 
   auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
-			 CODE_ENVIRONMENT_UTILITY, 0);
-
-  for (auto i = args.begin(); i != args.end(); ++i) {
-    if (ceph_argparse_flag(args, i, "-h", "--help", (char*)NULL)) {
-      usage();
-      return EXIT_SUCCESS;
-    }
-  }
+			 CODE_ENVIRONMENT_UTILITY,
+			 CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
 
   if (args.size() < 2) {
     usage();

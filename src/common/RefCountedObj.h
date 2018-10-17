@@ -17,31 +17,43 @@
  
 #include "common/Mutex.h"
 #include "common/Cond.h"
-#include "include/atomic.h"
 #include "common/ceph_context.h"
 #include "common/valgrind.h"
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+// re-include our assert to clobber the system one; fix dout:
+#include "include/ceph_assert.h"
+
 struct RefCountedObject {
 private:
-  atomic_t nref;
+  mutable std::atomic<uint64_t> nref;
   CephContext *cct;
 public:
   RefCountedObject(CephContext *c = NULL, int n=1) : nref(n), cct(c) {}
   virtual ~RefCountedObject() {
-    assert(nref.read() == 0);
+    ceph_assert(nref == 0);
   }
   
-  RefCountedObject *get() {
-    int v = nref.inc();
+  const RefCountedObject *get() const {
+    int v = ++nref;
     if (cct)
       lsubdout(cct, refs, 1) << "RefCountedObject::get " << this << " "
 			     << (v - 1) << " -> " << v
 			     << dendl;
     return this;
   }
-  void put() {
+  RefCountedObject *get() {
+    int v = ++nref;
+    if (cct)
+      lsubdout(cct, refs, 1) << "RefCountedObject::get " << this << " "
+			     << (v - 1) << " -> " << v
+			     << dendl;
+    return this;
+  }
+  void put() const {
     CephContext *local_cct = cct;
-    int v = nref.dec();
+    int v = --nref;
     if (v == 0) {
       ANNOTATE_HAPPENS_AFTER(&nref);
       ANNOTATE_HAPPENS_BEFORE_FORGET_ALL(&nref);
@@ -59,7 +71,7 @@ public:
   }
 
   uint64_t get_nref() const {
-    return nref.read();
+    return nref;
   }
 };
 
@@ -78,7 +90,7 @@ struct RefCountedCond : public RefCountedObject {
   RefCountedCond() : complete(false), lock("RefCountedCond"), rval(0) {}
 
   int wait() {
-    Mutex::Locker l(lock);
+    std::lock_guard<Mutex> l(lock);
     while (!complete) {
       cond.Wait(lock);
     }
@@ -86,7 +98,7 @@ struct RefCountedCond : public RefCountedObject {
   }
 
   void done(int r) {
-    Mutex::Locker l(lock);
+    std::lock_guard<Mutex> l(lock);
     rval = r;
     complete = true;
     cond.SignalAll();
@@ -109,10 +121,10 @@ struct RefCountedCond : public RefCountedObject {
  *    
  */
 struct RefCountedWaitObject {
-  atomic_t nref;
+  std::atomic<uint64_t> nref = { 1 };
   RefCountedCond *c;
 
-  RefCountedWaitObject() : nref(1) {
+  RefCountedWaitObject() {
     c = new RefCountedCond;
   }
   virtual ~RefCountedWaitObject() {
@@ -120,7 +132,7 @@ struct RefCountedWaitObject {
   }
 
   RefCountedWaitObject *get() {
-    nref.inc();
+    nref++;
     return this;
   }
 
@@ -128,7 +140,7 @@ struct RefCountedWaitObject {
     bool ret = false;
     RefCountedCond *cond = c;
     cond->get();
-    if (nref.dec() == 0) {
+    if (--nref == 0) {
       cond->done();
       delete this;
       ret = true;
@@ -141,7 +153,7 @@ struct RefCountedWaitObject {
     RefCountedCond *cond = c;
 
     cond->get();
-    if (nref.dec() == 0) {
+    if (--nref == 0) {
       cond->done();
       delete this;
     } else {
@@ -151,7 +163,13 @@ struct RefCountedWaitObject {
   }
 };
 
-void intrusive_ptr_add_ref(RefCountedObject *p);
-void intrusive_ptr_release(RefCountedObject *p);
+static inline void intrusive_ptr_add_ref(const RefCountedObject *p) {
+  p->get();
+}
+static inline void intrusive_ptr_release(const RefCountedObject *p) {
+  p->put();
+}
+
+using RefCountedPtr = boost::intrusive_ptr<RefCountedObject>;
 
 #endif

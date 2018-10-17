@@ -31,7 +31,7 @@ public:
     : Connection(cct, m),
       pipe(NULL) { }
 
-  ~PipeConnection();
+  ~PipeConnection() override;
 
   Pipe* get_pipe();
 
@@ -47,6 +47,10 @@ public:
   void send_keepalive() override;
   void mark_down() override;
   void mark_disposable() override;
+
+  entity_addr_t get_peer_socket_addr() const override {
+    return peer_addrs.front();
+  }
 
 }; /* PipeConnection */
 

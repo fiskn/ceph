@@ -24,7 +24,7 @@ def task(ctx, config):
 
     cluster: (default 'ceph') the name of the cluster to thrash
 
-    min_in: (default 3) the minimum number of OSDs to keep in the
+    min_in: (default 4) the minimum number of OSDs to keep in the
        cluster
 
     min_out: (default 0) the minimum number of OSDs to keep out of the
@@ -76,6 +76,8 @@ def task(ctx, config):
     chance_pgnum_grow: (0) chance to increase a pool's size
     chance_pgpnum_fix: (0) chance to adjust pgpnum to pg for a pool
     pool_grow_by: (10) amount to increase pgnum by
+    chance_pgnum_shrink: (0) chance to decrease a pool's size
+    pool_shrink_by: (10) amount to decrease pgnum by
     max_pgs_per_pool_osd: (1200) don't expand pools past this size per osd
 
     pause_short: (3) duration of short pause
@@ -120,6 +122,11 @@ def task(ctx, config):
     disable_objectstore_tool_tests: (false) disable ceph_objectstore_tool based
                                     tests
 
+    chance_thrash_cluster_full: .05
+
+    chance_thrash_pg_upmap: 1.0
+    chance_thrash_pg_upmap_items: 1.0
+
     example:
 
     tasks:
@@ -144,6 +151,8 @@ def task(ctx, config):
     config['dump_ops_enable'] = config.get('dump_ops_enable', "true")
     # add default value for noscrub_toggle_delay
     config['noscrub_toggle_delay'] = config.get('noscrub_toggle_delay', 2.0)
+    # add default value for random_eio
+    config['random_eio'] = config.get('random_eio', 0.0)
 
     log.info("config is {config}".format(config=str(config)))
 
@@ -192,4 +201,6 @@ def task(ctx, config):
     finally:
         log.info('joining thrashosds')
         thrash_proc.do_join()
+        cluster_manager.wait_for_all_osds_up()
+        cluster_manager.flush_all_pg_stats()
         cluster_manager.wait_for_recovery(config.get('timeout', 360))

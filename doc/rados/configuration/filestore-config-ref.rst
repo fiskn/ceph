@@ -8,7 +8,7 @@
 :Description: Debugging check on synchronization. Expensive. For debugging only.
 :Type: Boolean
 :Required: No
-:Default: ``0``
+:Default: ``false``
 
 
 .. index:: filestore; extended attributes
@@ -32,9 +32,9 @@ xattrs`` threshold is reached.
 
 ``filestore max inline xattr size``
 
-:Description: The maximimum size of an XATTR stored in the filesystem (i.e., XFS,
+:Description: The maximum size of an XATTR stored in the filesystem (i.e., XFS,
               btrfs, ext4, etc.) per object. Should not be larger than the
-              filesytem can handle. Default value of 0 means to use the value
+              filesystem can handle. Default value of 0 means to use the value
               specific to the underlying filesystem.
 :Type: Unsigned 32-bit Integer
 :Required: No
@@ -43,7 +43,7 @@ xattrs`` threshold is reached.
 
 ``filestore max inline xattr size xfs``
 
-:Description: The maximimum size of an XATTR stored in the XFS filesystem.
+:Description: The maximum size of an XATTR stored in the XFS filesystem.
               Only used if ``filestore max inline xattr size`` == 0.
 :Type: Unsigned 32-bit Integer
 :Required: No
@@ -52,7 +52,7 @@ xattrs`` threshold is reached.
 
 ``filestore max inline xattr size btrfs``
 
-:Description: The maximimum size of an XATTR stored in the btrfs filesystem.
+:Description: The maximum size of an XATTR stored in the btrfs filesystem.
               Only used if ``filestore max inline xattr size`` == 0.
 :Type: Unsigned 32-bit Integer
 :Required: No
@@ -61,7 +61,7 @@ xattrs`` threshold is reached.
 
 ``filestore max inline xattr size other``
 
-:Description: The maximimum size of an XATTR stored in other filesystems.
+:Description: The maximum size of an XATTR stored in other filesystems.
               Only used if ``filestore max inline xattr size`` == 0.
 :Type: Unsigned 32-bit Integer
 :Required: No
@@ -192,7 +192,7 @@ The following settings provide limits on the size of filestore queue.
 :Description: Defines the maximum number of in progress operations the file store accepts before blocking on queuing new operations. 
 :Type: Integer
 :Required: No. Minimal impact on performance.
-:Default: ``500``
+:Default: ``50``
 
 
 ``filestore queue max bytes``
@@ -203,20 +203,6 @@ The following settings provide limits on the size of filestore queue.
 :Default: ``100 << 20``
 
 
-``filestore queue committing max ops``
-
-:Description: The maximum number of operations the filestore can commit. 
-:Type: Integer
-:Required: No
-:Default: ``500``
-
-
-``filestore queue committing max bytes``
-
-:Description: The maximum number of bytes the filestore can commit.
-:Type: Integer
-:Required: No
-:Default: ``100 << 20``
 
 
 .. index:: filestore; timeouts
@@ -311,18 +297,31 @@ Misc
               NOTE: A negative value means to disable subdir merging
 :Type: Integer
 :Required: No
-:Default: ``10``
+:Default: ``-10``
 
 
 ``filestore split multiple``
 
-:Description:  ``filestore_split_multiple * abs(filestore_merge_threshold) * 16`` 
+:Description:  ``(filestore_split_multiple * abs(filestore_merge_threshold) + (rand() % filestore_split_rand_factor)) * 16``
                is the maximum number of files in a subdirectory before 
                splitting into child directories.
 
 :Type: Integer
 :Required: No
 :Default: ``2``
+
+
+``filestore split rand factor``
+
+:Description:  A random factor added to the split threshold to avoid
+               too many filestore splits occurring at once. See
+               ``filestore split multiple`` for details.
+               This can only be changed for an existing osd offline,
+               via ceph-objectstore-tool's apply-layout-settings command.
+
+:Type: Unsigned 32-bit Integer
+:Required: No
+:Default: ``20``
 
 
 ``filestore update to``

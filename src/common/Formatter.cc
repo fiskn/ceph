@@ -14,29 +14,12 @@
 
 #define LARGE_SIZE 1024
 
-#include "include/int_types.h"
-
-#include "assert.h"
-#include "Formatter.h"
 #include "HTMLFormatter.h"
 #include "common/escape.h"
 #include "include/buffer.h"
 
-#include <algorithm>
-#include <iostream>
-#include <sstream>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <vector>
-#include <string>
 #include <set>
 #include <boost/format.hpp>
-
-
-static char tolower_underscore(const char b) {
-  return ' ' == b ? '_' : std::tolower(b);
-}
 
 // -----------------------
 namespace ceph {
@@ -69,11 +52,11 @@ Formatter::Formatter() { }
 
 Formatter::~Formatter() { }
 
-Formatter *Formatter::create(const std::string &type,
-			     const std::string& default_type,
-			     const std::string& fallback)
+Formatter *Formatter::create(std::string_view type,
+			     std::string_view default_type,
+			     std::string_view fallback)
 {
-  std::string mytype = type;
+  std::string mytype(type);
   if (mytype == "")
     mytype = default_type;
 
@@ -144,6 +127,8 @@ void JSONFormatter::flush(std::ostream& os)
 {
   finish_pending_string();
   os << m_ss.str();
+  if (m_line_break_enabled)
+    os << "\n";
   m_ss.clear();
   m_ss.str("");
 }
@@ -176,12 +161,9 @@ void JSONFormatter::print_comma(json_formatter_stack_entry_d& entry)
     m_ss << "    ";
 }
 
-void JSONFormatter::print_quoted_string(const std::string& s)
+void JSONFormatter::print_quoted_string(std::string_view s)
 {
-  int len = escape_json_attr_len(s.c_str(), s.size());
-  char escaped[len];
-  escape_json_attr(s.c_str(), s.size(), escaped);
-  m_ss << '\"' << escaped << '\"';
+  m_ss << '\"' << json_stream_escaper(s) << '\"';
 }
 
 void JSONFormatter::print_name(const char *name)
@@ -243,7 +225,7 @@ void JSONFormatter::open_object_section_in_ns(const char *name, const char *ns)
 
 void JSONFormatter::close_section()
 {
-  assert(!m_stack.empty());
+  ceph_assert(!m_stack.empty());
   finish_pending_string();
 
   struct json_formatter_stack_entry_d& entry = m_stack.back();
@@ -287,7 +269,7 @@ void JSONFormatter::dump_float(const char *name, double d)
   m_ss << foo;
 }
 
-void JSONFormatter::dump_string(const char *name, const std::string& s)
+void JSONFormatter::dump_string(const char *name, std::string_view s)
 {
   print_name(name);
   print_quoted_string(s);
@@ -326,9 +308,10 @@ void JSONFormatter::write_raw_data(const char *data)
 const char *XMLFormatter::XML_1_DTD =
   "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
 
-XMLFormatter::XMLFormatter(bool pretty, bool lowercased_underscored)
+XMLFormatter::XMLFormatter(bool pretty, bool lowercased, bool underscored)
 : m_pretty(pretty),
-  m_lowercased_underscored(lowercased_underscored)
+  m_lowercased(lowercased),
+  m_underscored(underscored)
 {
   reset();
 }
@@ -341,6 +324,8 @@ void XMLFormatter::flush(std::ostream& os)
   /* There is a small catch here. If the rest of the formatter had NO output,
    * we should NOT output a newline. This primarily triggers on HTTP redirects */
   if (m_pretty && !m_ss_str.empty())
+    os << "\n";
+  else if (m_line_break_enabled)
     os << "\n";
   m_ss.clear();
   m_ss.str("");
@@ -361,7 +346,7 @@ void XMLFormatter::output_header()
 {
   if(!m_header_done) {
     m_header_done = true;
-    write_raw_data(XMLFormatter::XML_1_DTD);;
+    write_raw_data(XMLFormatter::XML_1_DTD);
     if (m_pretty)
       m_ss << "\n";
   }
@@ -406,14 +391,12 @@ void XMLFormatter::open_array_section_in_ns(const char *name, const char *ns)
 
 void XMLFormatter::close_section()
 {
-  assert(!m_sections.empty());
+  ceph_assert(!m_sections.empty());
   finish_pending_string();
 
   std::string section = m_sections.back();
-  if (m_lowercased_underscored) {
-    std::transform(section.begin(), section.end(), section.begin(),
-          tolower_underscore);
-  }
+  std::transform(section.begin(), section.end(), section.begin(),
+	 [this](char c) { return this->to_lower_underscore(c); });
   m_sections.pop_back();
   print_spaces();
   m_ss << "</" << section << ">";
@@ -424,9 +407,9 @@ void XMLFormatter::close_section()
 void XMLFormatter::dump_unsigned(const char *name, uint64_t u)
 {
   std::string e(name);
-  if (m_lowercased_underscored) {
-    std::transform(e.begin(), e.end(), e.begin(), tolower_underscore);
-  }
+  std::transform(e.begin(), e.end(), e.begin(),
+      [this](char c) { return this->to_lower_underscore(c); });
+
   print_spaces();
   m_ss << "<" << e << ">" << u << "</" << e << ">";
   if (m_pretty)
@@ -436,9 +419,9 @@ void XMLFormatter::dump_unsigned(const char *name, uint64_t u)
 void XMLFormatter::dump_int(const char *name, int64_t u)
 {
   std::string e(name);
-  if (m_lowercased_underscored) {
-    std::transform(e.begin(), e.end(), e.begin(), tolower_underscore);
-  }
+  std::transform(e.begin(), e.end(), e.begin(),
+      [this](char c) { return this->to_lower_underscore(c); });
+
   print_spaces();
   m_ss << "<" << e << ">" << u << "</" << e << ">";
   if (m_pretty)
@@ -448,37 +431,37 @@ void XMLFormatter::dump_int(const char *name, int64_t u)
 void XMLFormatter::dump_float(const char *name, double d)
 {
   std::string e(name);
-  if (m_lowercased_underscored) {
-    std::transform(e.begin(), e.end(), e.begin(), tolower_underscore);
-  }
+  std::transform(e.begin(), e.end(), e.begin(),
+      [this](char c) { return this->to_lower_underscore(c); });
+
   print_spaces();
   m_ss << "<" << e << ">" << d << "</" << e << ">";
   if (m_pretty)
     m_ss << "\n";
 }
 
-void XMLFormatter::dump_string(const char *name, const std::string& s)
+void XMLFormatter::dump_string(const char *name, std::string_view s)
 {
   std::string e(name);
-  if (m_lowercased_underscored) {
-    std::transform(e.begin(), e.end(), e.begin(), tolower_underscore);
-  }
+  std::transform(e.begin(), e.end(), e.begin(),
+      [this](char c) { return this->to_lower_underscore(c); });
+
   print_spaces();
-  m_ss << "<" << e << ">" << escape_xml_str(s.c_str()) << "</" << e << ">";
+  m_ss << "<" << e << ">" << xml_stream_escaper(s) << "</" << e << ">";
   if (m_pretty)
     m_ss << "\n";
 }
 
-void XMLFormatter::dump_string_with_attrs(const char *name, const std::string& s, const FormatterAttrs& attrs)
+void XMLFormatter::dump_string_with_attrs(const char *name, std::string_view s, const FormatterAttrs& attrs)
 {
   std::string e(name);
-  if (m_lowercased_underscored) {
-    std::transform(e.begin(), e.end(), e.begin(), tolower_underscore);
-  }
+  std::transform(e.begin(), e.end(), e.begin(),
+      [this](char c) { return this->to_lower_underscore(c); });
+
   std::string attrs_str;
   get_attrs_str(&attrs, attrs_str);
   print_spaces();
-  m_ss << "<" << e << attrs_str << ">" << escape_xml_str(s.c_str()) << "</" << e << ">";
+  m_ss << "<" << e << attrs_str << ">" << xml_stream_escaper(s) << "</" << e << ">";
   if (m_pretty)
     m_ss << "\n";
 }
@@ -494,17 +477,16 @@ std::ostream& XMLFormatter::dump_stream(const char *name)
 void XMLFormatter::dump_format_va(const char* name, const char *ns, bool quoted, const char *fmt, va_list ap)
 {
   char buf[LARGE_SIZE];
-  vsnprintf(buf, LARGE_SIZE, fmt, ap);
-
+  size_t len = vsnprintf(buf, LARGE_SIZE, fmt, ap);
   std::string e(name);
-  if (m_lowercased_underscored) {
-    std::transform(e.begin(), e.end(), e.begin(), tolower_underscore);
-  }
+  std::transform(e.begin(), e.end(), e.begin(),
+      [this](char c) { return this->to_lower_underscore(c); });
+
   print_spaces();
   if (ns) {
     m_ss << "<" << e << " xmlns=\"" << ns << "\">" << buf << "</" << e << ">";
   } else {
-    m_ss << "<" << e << ">" << escape_xml_str(buf) << "</" << e << ">";
+    m_ss << "<" << e << ">" << xml_stream_escaper(std::string_view(buf, len)) << "</" << e << ">";
   }
 
   if (m_pretty)
@@ -544,9 +526,8 @@ void XMLFormatter::open_section_in_ns(const char *name, const char *ns, const Fo
   }
 
   std::string e(name);
-  if (m_lowercased_underscored) {
-    std::transform(e.begin(), e.end(), e.begin(), tolower_underscore);
-  }
+  std::transform(e.begin(), e.end(), e.begin(),
+      [this](char c) { return this->to_lower_underscore(c); });
 
   if (ns) {
     m_ss << "<" << e << attrs_str << " xmlns=\"" << ns << "\">";
@@ -561,7 +542,7 @@ void XMLFormatter::open_section_in_ns(const char *name, const char *ns, const Fo
 void XMLFormatter::finish_pending_string()
 {
   if (!m_pending_string_name.empty()) {
-    m_ss << escape_xml_str(m_pending_string.str().c_str())
+    m_ss << xml_stream_escaper(m_pending_string.str())
       << "</" << m_pending_string_name << ">";
     m_pending_string_name.clear();
     m_pending_string.str(std::string());
@@ -580,12 +561,14 @@ void XMLFormatter::print_spaces()
   }
 }
 
-std::string XMLFormatter::escape_xml_str(const char *str)
+char XMLFormatter::to_lower_underscore(char c) const
 {
-  int len = escape_xml_attr_len(str);
-  std::vector<char> escaped(len, '\0');
-  escape_xml_attr(str, &escaped[0]);
-  return std::string(&escaped[0]);
+  if (m_underscored && c == ' ') {
+      return '_';
+  } else if (m_lowercased) {
+    return std::tolower(c);
+  }
+  return c;
 }
 
 TableFormatter::TableFormatter(bool keyval) : m_keyval(keyval)
@@ -843,7 +826,7 @@ void TableFormatter::dump_float(const char *name, double d)
   m_ss.str("");
 }
 
-void TableFormatter::dump_string(const char *name, const std::string& s)
+void TableFormatter::dump_string(const char *name, std::string_view s)
 {
   finish_pending_string();
   size_t i = m_vec_index(name);
@@ -854,7 +837,7 @@ void TableFormatter::dump_string(const char *name, const std::string& s)
   m_ss.str("");
 }
 
-void TableFormatter::dump_string_with_attrs(const char *name, const std::string& s, const FormatterAttrs& attrs)
+void TableFormatter::dump_string_with_attrs(const char *name, std::string_view s, const FormatterAttrs& attrs)
 {
   finish_pending_string();
   size_t i = m_vec_index(name);

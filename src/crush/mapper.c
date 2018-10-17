@@ -104,7 +104,7 @@ static int bucket_perm_choose(const struct crush_bucket *bucket,
 
 	/* calculate permutation up to pr */
 	for (i = 0; i < work->perm_n; i++)
-		dprintk(" perm_choose have %d: %d\n", i, bucket->perm[i]);
+		dprintk(" perm_choose have %d: %d\n", i, work->perm[i]);
 	while (work->perm_n <= pr) {
 		unsigned int p = work->perm_n;
 		/* no point in swapping the final entry */
@@ -121,7 +121,7 @@ static int bucket_perm_choose(const struct crush_bucket *bucket,
 		work->perm_n++;
 	}
 	for (i = 0; i < bucket->size; i++)
-		dprintk(" perm_choose  %d: %d\n", i, bucket->perm[i]);
+		dprintk(" perm_choose  %d: %d\n", i, work->perm[i]);
 
 	s = work->perm[pr];
 out:
@@ -293,46 +293,83 @@ static __u64 crush_ln(unsigned int xin)
 /*
  * straw2
  *
+ * Suppose we have two osds: osd.0 and osd.1, with weight 8 and 4 respectively, It means:
+ *   a). For osd.0, the time interval between each io request apply to exponential distribution 
+ *       with lamba equals 8
+ *   b). For osd.1, the time interval between each io request apply to exponential distribution 
+ *       with lamba equals 4
+ *   c). If we apply to each osd's exponential random variable, then the total pgs on each osd
+ *       is proportional to its weight.
+ *
  * for reference, see:
  *
  * http://en.wikipedia.org/wiki/Exponential_distribution#Distribution_of_the_minimum_of_exponential_random_variables
- *
  */
 
+static inline __u32 *get_choose_arg_weights(const struct crush_bucket_straw2 *bucket,
+                                            const struct crush_choose_arg *arg,
+                                            int position)
+{
+	if ((arg == NULL) || (arg->weight_set == NULL))
+		return bucket->item_weights;
+	if (position >= arg->weight_set_positions)
+		position = arg->weight_set_positions - 1;
+	return arg->weight_set[position].weights;
+}
+
+static inline __s32 *get_choose_arg_ids(const struct crush_bucket_straw2 *bucket,
+					const struct crush_choose_arg *arg)
+{
+	if ((arg == NULL) || (arg->ids == NULL))
+		return bucket->h.items;
+	return arg->ids;
+}
+
+/*
+ * Compute exponential random variable using inversion method.
+ *
+ * for reference, see the exponential distribution example at:  
+ * https://en.wikipedia.org/wiki/Inverse_transform_sampling#Examples
+ */
+static inline __s64 generate_exponential_distribution(int type, int x, int y, int z, 
+                                                      int weight)
+{
+	unsigned int u = crush_hash32_3(type, x, y, z);
+	u &= 0xffff;
+
+	/*
+	 * for some reason slightly less than 0x10000 produces
+	 * a slightly more accurate distribution... probably a
+	 * rounding effect.
+	 *
+	 * the natural log lookup table maps [0,0xffff]
+	 * (corresponding to real numbers [1/0x10000, 1] to
+	 * [0, 0xffffffffffff] (corresponding to real numbers
+	 * [-11.090355,0]).
+	 */
+	__s64 ln = crush_ln(u) - 0x1000000000000ll;
+
+	/*
+	 * divide by 16.16 fixed-point weight.  note
+	 * that the ln value is negative, so a larger
+	 * weight means a larger (less negative) value
+	 * for draw.
+	 */
+	return div64_s64(ln, weight);
+}
+
 static int bucket_straw2_choose(const struct crush_bucket_straw2 *bucket,
-				int x, int r)
+				int x, int r, const struct crush_choose_arg *arg,
+                                int position)
 {
 	unsigned int i, high = 0;
-	unsigned int u;
-	unsigned int w;
-	__s64 ln, draw, high_draw = 0;
-
+	__s64 draw, high_draw = 0;
+        __u32 *weights = get_choose_arg_weights(bucket, arg, position);
+        __s32 *ids = get_choose_arg_ids(bucket, arg);
 	for (i = 0; i < bucket->h.size; i++) {
-		w = bucket->item_weights[i];
-		if (w) {
-			u = crush_hash32_3(bucket->h.hash, x,
-					   bucket->h.items[i], r);
-			u &= 0xffff;
-
-			/*
-			 * for some reason slightly less than 0x10000 produces
-			 * a slightly more accurate distribution... probably a
-			 * rounding effect.
-			 *
-			 * the natural log lookup table maps [0,0xffff]
-			 * (corresponding to real numbers [1/0x10000, 1] to
-			 * [0, 0xffffffffffff] (corresponding to real numbers
-			 * [-11.090355,0]).
-			 */
-			ln = crush_ln(u) - 0x1000000000000ll;
-
-			/*
-			 * divide by 16.16 fixed-point weight.  note
-			 * that the ln value is negative, so a larger
-			 * weight means a larger (less negative) value
-			 * for draw.
-			 */
-			draw = div64_s64(ln, w);
+                dprintk("weight 0x%x item %d\n", weights[i], ids[i]);
+		if (weights[i]) {
+			draw = generate_exponential_distribution(bucket->h.hash, x, ids[i], r, weights[i]);
 		} else {
 			draw = S64_MIN;
 		}
@@ -349,7 +386,9 @@ static int bucket_straw2_choose(const struct crush_bucket_straw2 *bucket,
 
 static int crush_bucket_choose(const struct crush_bucket *in,
 			       struct crush_work_bucket *work,
-			       int x, int r)
+			       int x, int r,
+                               const struct crush_choose_arg *arg,
+                               int position)
 {
 	dprintk(" crush_bucket_choose %d x=%d r=%d\n", in->id, x, r);
 	BUG_ON(in->size == 0);
@@ -371,7 +410,7 @@ static int crush_bucket_choose(const struct crush_bucket *in,
 	case CRUSH_BUCKET_STRAW2:
 		return bucket_straw2_choose(
 			(const struct crush_bucket_straw2 *)in,
-			x, r);
+			x, r, arg, position);
 	default:
 		dprintk("unknown bucket %d alg %d\n", in->id, in->alg);
 		return in->items[0];
@@ -433,7 +472,8 @@ static int crush_choose_firstn(const struct crush_map *map,
 			       unsigned int vary_r,
 			       unsigned int stable,
 			       int *out2,
-			       int parent_r)
+			       int parent_r,
+                               const struct crush_choose_arg *choose_args)
 {
 	int rep;
 	unsigned int ftotal, flocal;
@@ -485,7 +525,9 @@ parent_r %d stable %d\n",
 				else
 					item = crush_bucket_choose(
 						in, work->work[-1-in->id],
-						x, r);
+						x, r,
+                                                (choose_args ? &choose_args[-1-in->id] : 0),
+                                                outpos);
 				if (item >= map->max_devices) {
 					dprintk("   bad item %d\n", item);
 					skip_rep = 1;
@@ -542,23 +584,22 @@ parent_r %d stable %d\n",
 							    vary_r,
 							    stable,
 							    NULL,
-							    sub_r) <= outpos)
+							    sub_r,
+                                                            choose_args) <= outpos)
 							/* didn't get leaf */
 							reject = 1;
 					} else {
 						/* we already have a leaf! */
 						out2[outpos] = item;
-		}
+		                        }
 				}
 
-				if (!reject) {
+				if (!reject && !collide) {
 					/* out? */
 					if (itemtype == 0)
 						reject = is_out(map, weight,
 								weight_max,
 								item, x);
-					else
-						reject = 0;
 				}
 
 reject:
@@ -621,7 +662,8 @@ static void crush_choose_indep(const struct crush_map *map,
 			       unsigned int recurse_tries,
 			       int recurse_to_leaf,
 			       int *out2,
-			       int parent_r)
+			       int parent_r,
+                               const struct crush_choose_arg *choose_args)
 {
 	const struct crush_bucket *in = bucket;
 	int endpos = outpos + left;
@@ -693,7 +735,9 @@ static void crush_choose_indep(const struct crush_map *map,
 
 				item = crush_bucket_choose(
 					in, work->work[-1-in->id],
-					x, r);
+					x, r,
+                                        (choose_args ? &choose_args[-1-in->id] : 0),
+                                        outpos);
 				if (item >= map->max_devices) {
 					dprintk("   bad item %d\n", item);
 					out[rep] = CRUSH_ITEM_NONE;
@@ -747,7 +791,7 @@ static void crush_choose_indep(const struct crush_map *map,
 							x, 1, numrep, 0,
 							out2, rep,
 							recurse_tries, 0,
-							0, NULL, r);
+							0, NULL, r, choose_args);
 						if (out2[rep] == CRUSH_ITEM_NONE) {
 							/* placed nothing; no leaf */
 							break;
@@ -821,7 +865,7 @@ void crush_init_workspace(const struct crush_map *m, void *v) {
 	struct crush_work *w = (struct crush_work *)v;
 	char *point = (char *)v;
 	__s32 b;
-	point += sizeof(struct crush_work *);
+	point += sizeof(struct crush_work);
 	w->work = (struct crush_work_bucket **)point;
 	point += m->max_buckets * sizeof(struct crush_work_bucket *);
 	for (b = 0; b < m->max_buckets; ++b) {
@@ -856,7 +900,7 @@ void crush_init_workspace(const struct crush_map *m, void *v) {
 int crush_do_rule(const struct crush_map *map,
 		  int ruleno, int x, int *result, int result_max,
 		  const __u32 *weight, int weight_max,
-		  void *cwin)
+		  void *cwin, const struct crush_choose_arg *choose_args)
 {
 	int result_len;
 	struct crush_work *cw = cwin;
@@ -966,11 +1010,6 @@ int crush_do_rule(const struct crush_map *map,
 
 			for (i = 0; i < wsize; i++) {
 				int bno;
-				/*
-				 * see CRUSH_N, CRUSH_N_MINUS macros.
-				 * basically, numrep <= 0 means relative to
-				 * the provided result_max
-				 */
 				numrep = curstep->arg1;
 				if (numrep <= 0) {
 					numrep += result_max;
@@ -1011,7 +1050,8 @@ int crush_do_rule(const struct crush_map *map,
 						vary_r,
 						stable,
 						c+osize,
-						0);
+						0,
+						choose_args);
 				} else {
 					out_size = ((numrep < (result_max-osize)) ?
 						    numrep : (result_max-osize));
@@ -1028,7 +1068,8 @@ int crush_do_rule(const struct crush_map *map,
 						   choose_leaf_tries : 1,
 						recurse_to_leaf,
 						c+osize,
-						0);
+						0,
+						choose_args);
 					osize += out_size;
 				}
 			}

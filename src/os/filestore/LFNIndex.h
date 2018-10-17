@@ -20,7 +20,6 @@
 #include <map>
 #include <set>
 #include <vector>
-#include "include/memory.h"
 #include <exception>
 
 #include "osd/osd_types.h"
@@ -42,11 +41,11 @@
  *
  * User must call created when an object is created.
  *
- * Syncronization: Calling code must ensure that there are no object
+ * Synchronization: Calling code must ensure that there are no object
  * creations or deletions during the lifetime of a Path object (except
  * of an object at that path).
  *
- * Unless otherwise noted, methods which return an int return 0 on sucess
+ * Unless otherwise noted, methods which return an int return 0 on success
  * and a negative error code on failure.
  */
 #define WRAP_RETRY(x) {				\
@@ -57,13 +56,13 @@
     try {					\
       if (failed) {				\
 	r = cleanup();				\
-	assert(r == 0);				\
+	ceph_assert(r == 0);				\
       }						\
       { x }					\
       out:					\
       complete_inject_failure();		\
       return r;					\
-    } catch (RetryException) {			\
+    } catch (RetryException&) {			\
       failed = true;				\
     } catch (...) {				\
       ceph_abort();				\
@@ -127,11 +126,12 @@ private:
 public:
   /// Constructor
   LFNIndex(
+    CephContext* cct,
     coll_t collection,
     const char *base_path, ///< [in] path to Index root
     uint32_t index_version,
     double _error_injection_probability=0)
-    : CollectionIndex(collection),
+    : CollectionIndex(cct, collection),
       base_path(base_path),
       index_version(index_version),
       error_injection_enabled(false),
@@ -149,54 +149,57 @@ public:
    }
   }
 
-  coll_t coll() const { return collection; }
+  coll_t coll() const override { return collection; }
 
   /// Virtual destructor
-  virtual ~LFNIndex() {}
+  ~LFNIndex() override {}
 
   /// @see CollectionIndex
-  int init();
+  int init() override;
 
   /// @see CollectionIndex
-  int cleanup() = 0;
+  int cleanup() override = 0;
 
   /// @see CollectionIndex
   int created(
     const ghobject_t &oid,
     const char *path
-    );
+    ) override;
 
   /// @see CollectionIndex
   int unlink(
     const ghobject_t &oid
-    );
+    ) override;
 
   /// @see CollectionIndex
   int lookup(
     const ghobject_t &oid,
     IndexedPath *path,
     int *hardlink
-    );
+    ) override;
 
   /// @see CollectionIndex;
   int pre_hash_collection(
       uint32_t pg_num,
       uint64_t expected_num_objs
-      );
+      ) override;
 
   /// @see CollectionIndex
   int collection_list_partial(
     const ghobject_t &start,
     const ghobject_t &end,
-    bool sort_bitwise,
     int max_count,
     vector<ghobject_t> *ls,
     ghobject_t *next
-    );
+    ) override;
 
   virtual int _split(
     uint32_t match,                             //< [in] value to match
     uint32_t bits,                              //< [in] bits to check
+    CollectionIndex* dest                       //< [in] destination index
+    ) = 0;
+  virtual int _merge(
+    uint32_t bits,                              //< [in] bits for target
     CollectionIndex* dest                       //< [in] destination index
     ) = 0;
 
@@ -205,9 +208,20 @@ public:
     uint32_t match,
     uint32_t bits,
     CollectionIndex* dest
-    ) {
+    ) override {
     WRAP_RETRY(
       r = _split(match, bits, dest);
+      goto out;
+      );
+  }
+
+  /// @see CollectionIndex
+  int merge(
+    uint32_t bits,
+    CollectionIndex* dest
+    ) override {
+    WRAP_RETRY(
+      r = _merge(bits, dest);
       goto out;
       );
   }
@@ -254,7 +268,6 @@ protected:
   virtual int _collection_list_partial(
     const ghobject_t &start,
     const ghobject_t &end,
-    bool sort_bitwise,
     int max_count,
     vector<ghobject_t> *ls,
     ghobject_t *next
@@ -299,7 +312,7 @@ protected:
   /**
    * Moves contents of from into to.
    *
-   * Invalidates mangled names in to.  If interupted, all objects will be
+   * Invalidates mangled names in to.  If interrupted, all objects will be
    * present in to before objects are removed from from.  Ignores EEXIST
    * while linking into to.
    * @return Error Code, 0 on success
@@ -396,7 +409,7 @@ protected:
     bufferlist &attr_value	///< [in] Value to save.
     );
 
-  /// Read into attr_value atribute attr_name on path.
+  /// Read into attr_value attribute attr_name on path.
   int get_attr_path(
     const vector<string> &path, ///< [in] Path to read.
     const string &attr_name, 	///< [in] Attribute to read.
@@ -423,7 +436,7 @@ private:
   }
 
   /**
-   * Gets the filename corresponsing to oid in path.
+   * Gets the filename corresponding to oid in path.
    *
    * @param [in] path Path in which to get filename for oid.
    * @param [in] oid Object for which to get filename.
@@ -505,19 +518,19 @@ private:
   int lfn_parse_object_name_keyless(
     const string &long_name, ///< [in] Name to parse
     ghobject_t *out	     ///< [out] Resulting Object
-    ); ///< @return True if successfull, False otherwise.
+    ); ///< @return True if successful, False otherwise.
 
   /// Parse object name
   int lfn_parse_object_name_poolless(
     const string &long_name, ///< [in] Name to parse
     ghobject_t *out	     ///< [out] Resulting Object
-    ); ///< @return True if successfull, False otherwise.
+    ); ///< @return True if successful, False otherwise.
 
   /// Parse object name
   int lfn_parse_object_name(
     const string &long_name, ///< [in] Name to parse
     ghobject_t *out	     ///< [out] Resulting Object
-    ); ///< @return True if successfull, False otherwise.
+    ); ///< @return True if successful, False otherwise.
 
   /// Checks whether short_name is a hashed filename.
   bool lfn_is_hashed_filename(

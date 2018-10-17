@@ -2,12 +2,15 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/operation/ResizeRequest.h"
-#include "librbd/AioImageRequestWQ.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/internal.h"
 #include "librbd/ObjectMap.h"
 #include "librbd/Utils.h"
+#include "librbd/io/AioCompletion.h"
+#include "librbd/io/ImageDispatchSpec.h"
+#include "librbd/io/ImageRequestWQ.h"
+#include "librbd/io/ObjectDispatcher.h"
 #include "librbd/operation/TrimRequest.h"
 #include "common/dout.h"
 #include "common/errno.h"
@@ -21,7 +24,7 @@ namespace operation {
 
 using util::create_async_context_callback;
 using util::create_context_callback;
-using util::create_rados_safe_callback;
+using util::create_rados_callback;
 
 template <typename I>
 ResizeRequest<I>::ResizeRequest(I &image_ctx, Context *on_finish,
@@ -40,7 +43,7 @@ ResizeRequest<I>::~ResizeRequest() {
   ResizeRequest *next_req = NULL;
   {
     RWLock::WLocker snap_locker(image_ctx.snap_lock);
-    assert(m_xlist_item.remove_myself());
+    ceph_assert(m_xlist_item.remove_myself());
     if (!image_ctx.resize_reqs.empty()) {
       next_req = image_ctx.resize_reqs.front();
     }
@@ -55,7 +58,7 @@ ResizeRequest<I>::~ResizeRequest() {
 template <typename I>
 void ResizeRequest<I>::send() {
   I &image_ctx = this->m_image_ctx;
-  assert(image_ctx.owner_lock.is_locked());
+  ceph_assert(image_ctx.owner_lock.is_locked());
 
   {
     RWLock::WLocker snap_locker(image_ctx.snap_lock);
@@ -66,7 +69,7 @@ void ResizeRequest<I>::send() {
       }
     }
 
-    assert(image_ctx.resize_reqs.front() == this);
+    ceph_assert(image_ctx.resize_reqs.front() == this);
     m_original_size = image_ctx.size;
     compute_parent_overlap();
   }
@@ -77,7 +80,7 @@ void ResizeRequest<I>::send() {
 template <typename I>
 void ResizeRequest<I>::send_op() {
   I &image_ctx = this->m_image_ctx;
-  assert(image_ctx.owner_lock.is_locked());
+  ceph_assert(image_ctx.owner_lock.is_locked());
 
   if (this->is_canceled()) {
     this->async_complete(-ERESTART);
@@ -92,7 +95,7 @@ void ResizeRequest<I>::send_pre_block_writes() {
   CephContext *cct = image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << dendl;
 
-  image_ctx.aio_work_queue->block_writes(create_context_callback<
+  image_ctx.io_work_queue->block_writes(create_context_callback<
     ResizeRequest<I>, &ResizeRequest<I>::handle_pre_block_writes>(this));
 }
 
@@ -104,7 +107,7 @@ Context *ResizeRequest<I>::handle_pre_block_writes(int *result) {
 
   if (*result < 0) {
     lderr(cct) << "failed to block writes: " << cpp_strerror(*result) << dendl;
-    image_ctx.aio_work_queue->unblock_writes();
+    image_ctx.io_work_queue->unblock_writes();
     return this->create_context_finisher(*result);
   }
 
@@ -140,7 +143,7 @@ Context *ResizeRequest<I>::handle_append_op_event(int *result) {
   if (*result < 0) {
     lderr(cct) << "failed to commit journal entry: " << cpp_strerror(*result)
                << dendl;
-    image_ctx.aio_work_queue->unblock_writes();
+    image_ctx.io_work_queue->unblock_writes();
     return this->create_context_finisher(*result);
   }
 
@@ -182,18 +185,19 @@ Context *ResizeRequest<I>::handle_trim_image(int *result) {
 template <typename I>
 void ResizeRequest<I>::send_flush_cache() {
   I &image_ctx = this->m_image_ctx;
-  if (image_ctx.object_cacher == nullptr) {
-    send_trim_image();
-    return;
-  }
 
   CephContext *cct = image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << dendl;
 
   RWLock::RLocker owner_locker(image_ctx.owner_lock);
-  image_ctx.flush_cache(create_async_context_callback(
-    image_ctx, create_context_callback<
-      ResizeRequest<I>, &ResizeRequest<I>::handle_flush_cache>(this)));
+  auto ctx = create_context_callback<
+    ResizeRequest<I>, &ResizeRequest<I>::handle_flush_cache>(this);
+  auto aio_comp = io::AioCompletion::create(
+    ctx, util::get_image_ctx(&image_ctx), io::AIO_TYPE_FLUSH);
+  auto req = io::ImageDispatchSpec<I>::create_flush_request(
+    image_ctx, aio_comp, io::FLUSH_SOURCE_INTERNAL, {});
+  req->send();
+  delete req;
 }
 
 template <typename I>
@@ -220,9 +224,8 @@ void ResizeRequest<I>::send_invalidate_cache() {
   // need to invalidate since we're deleting objects, and
   // ObjectCacher doesn't track non-existent objects
   RWLock::RLocker owner_locker(image_ctx.owner_lock);
-  image_ctx.invalidate_cache(create_async_context_callback(
-    image_ctx, create_context_callback<
-      ResizeRequest<I>, &ResizeRequest<I>::handle_invalidate_cache>(this)));
+  image_ctx.io_object_dispatcher->invalidate_cache(create_context_callback<
+    ResizeRequest<I>, &ResizeRequest<I>::handle_invalidate_cache>(this));
 }
 
 template <typename I>
@@ -252,7 +255,7 @@ Context *ResizeRequest<I>::send_grow_object_map() {
     RWLock::WLocker snap_locker(image_ctx.snap_lock);
     m_shrink_size_visible = true;
   }
-  image_ctx.aio_work_queue->unblock_writes();
+  image_ctx.io_work_queue->unblock_writes();
 
   if (m_original_size == m_new_size) {
     return this->create_context_finisher(0);
@@ -275,8 +278,8 @@ Context *ResizeRequest<I>::send_grow_object_map() {
   ldout(cct, 5) << this << " " << __func__ << dendl;
 
   // should have been canceled prior to releasing lock
-  assert(image_ctx.exclusive_lock == nullptr ||
-         image_ctx.exclusive_lock->is_lock_owner());
+  ceph_assert(image_ctx.exclusive_lock == nullptr ||
+              image_ctx.exclusive_lock->is_lock_owner());
 
   image_ctx.object_map->aio_resize(
     m_new_size, OBJECT_NONEXISTENT, create_context_callback<
@@ -292,7 +295,12 @@ Context *ResizeRequest<I>::handle_grow_object_map(int *result) {
   CephContext *cct = image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": r=" << *result << dendl;
 
-  assert(*result == 0);
+  if (*result < 0) {
+    lderr(cct) << this << " " << __func__ << ": failed to resize object map: "
+               << cpp_strerror(*result) << dendl;
+    return this->create_context_finisher(*result);
+  }
+
   send_post_block_writes();
   return nullptr;
 }
@@ -317,8 +325,8 @@ Context *ResizeRequest<I>::send_shrink_object_map() {
                 << "new_size=" << m_new_size << dendl;
 
   // should have been canceled prior to releasing lock
-  assert(image_ctx.exclusive_lock == nullptr ||
-         image_ctx.exclusive_lock->is_lock_owner());
+  ceph_assert(image_ctx.exclusive_lock == nullptr ||
+              image_ctx.exclusive_lock->is_lock_owner());
 
   image_ctx.object_map->aio_resize(
     m_new_size, OBJECT_NONEXISTENT, create_context_callback<
@@ -334,8 +342,14 @@ Context *ResizeRequest<I>::handle_shrink_object_map(int *result) {
   CephContext *cct = image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": r=" << *result << dendl;
 
+  if (*result < 0) {
+    lderr(cct) << this << " " << __func__ << ": failed to resize object map: "
+               << cpp_strerror(*result) << dendl;
+    image_ctx.io_work_queue->unblock_writes();
+    return this->create_context_finisher(*result);
+  }
+
   update_size_and_overlap();
-  assert(*result == 0);
   return this->create_context_finisher(0);
 }
 
@@ -346,7 +360,7 @@ void ResizeRequest<I>::send_post_block_writes() {
   ldout(cct, 5) << this << " " << __func__ << dendl;
 
   RWLock::RLocker owner_locker(image_ctx.owner_lock);
-  image_ctx.aio_work_queue->block_writes(create_context_callback<
+  image_ctx.io_work_queue->block_writes(create_context_callback<
     ResizeRequest<I>, &ResizeRequest<I>::handle_post_block_writes>(this));
 }
 
@@ -357,7 +371,7 @@ Context *ResizeRequest<I>::handle_post_block_writes(int *result) {
   ldout(cct, 5) << this << " " << __func__ << ": r=" << *result << dendl;
 
   if (*result < 0) {
-    image_ctx.aio_work_queue->unblock_writes();
+    image_ctx.io_work_queue->unblock_writes();
     lderr(cct) << "failed to block writes prior to header update: "
                << cpp_strerror(*result) << dendl;
     return this->create_context_finisher(*result);
@@ -377,8 +391,8 @@ void ResizeRequest<I>::send_update_header() {
 
   // should have been canceled prior to releasing lock
   RWLock::RLocker owner_locker(image_ctx.owner_lock);
-  assert(image_ctx.exclusive_lock == nullptr ||
-         image_ctx.exclusive_lock->is_lock_owner());
+  ceph_assert(image_ctx.exclusive_lock == nullptr ||
+              image_ctx.exclusive_lock->is_lock_owner());
 
   librados::ObjectWriteOperation op;
   if (image_ctx.old_format) {
@@ -391,11 +405,11 @@ void ResizeRequest<I>::send_update_header() {
     cls_client::set_size(&op, m_new_size);
   }
 
-  librados::AioCompletion *rados_completion = create_rados_safe_callback<
+  librados::AioCompletion *rados_completion = create_rados_callback<
     ResizeRequest<I>, &ResizeRequest<I>::handle_update_header>(this);
   int r = image_ctx.md_ctx.aio_operate(image_ctx.header_oid,
     				       rados_completion, &op);
-  assert(r == 0);
+  ceph_assert(r == 0);
   rados_completion->release();
 }
 
@@ -408,7 +422,7 @@ Context *ResizeRequest<I>::handle_update_header(int *result) {
   if (*result < 0) {
     lderr(cct) << "failed to update image header: " << cpp_strerror(*result)
                << dendl;
-    image_ctx.aio_work_queue->unblock_writes();
+    image_ctx.io_work_queue->unblock_writes();
     return this->create_context_finisher(*result);
   }
 
@@ -422,7 +436,7 @@ void ResizeRequest<I>::compute_parent_overlap() {
   if (image_ctx.parent == NULL) {
     m_new_parent_overlap = 0;
   } else {
-    m_new_parent_overlap = MIN(m_new_size, image_ctx.parent_md.overlap);
+    m_new_parent_overlap = std::min(m_new_size, image_ctx.parent_md.overlap);
   }
 }
 
@@ -440,7 +454,7 @@ void ResizeRequest<I>::update_size_and_overlap() {
   }
 
   // blocked by POST_BLOCK_WRITES state
-  image_ctx.aio_work_queue->unblock_writes();
+  image_ctx.io_work_queue->unblock_writes();
 }
 
 } // namespace operation

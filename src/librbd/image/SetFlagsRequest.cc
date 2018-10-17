@@ -7,7 +7,7 @@
 #include "cls/rbd/cls_rbd_client.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/Utils.h"
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -17,7 +17,7 @@ namespace librbd {
 namespace image {
 
 using util::create_context_callback;
-using util::create_rados_ack_callback;
+using util::create_rados_callback;
 
 template <typename I>
 SetFlagsRequest<I>::SetFlagsRequest(I *image_ctx, uint64_t flags,
@@ -52,9 +52,9 @@ void SetFlagsRequest<I>::send_set_flags() {
     cls_client::set_flags(&op, snap_id, m_flags, m_mask);
 
     librados::AioCompletion *comp =
-      create_rados_ack_callback(gather_ctx->new_sub());
+      create_rados_callback(gather_ctx->new_sub());
     int r = m_image_ctx->md_ctx.aio_operate(m_image_ctx->header_oid, comp, &op);
-    assert(r == 0);
+    ceph_assert(r == 0);
     comp->release();
   }
   gather_ctx->activate();

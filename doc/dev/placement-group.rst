@@ -45,12 +45,11 @@ is the primary and the rest are replicas.
 Many PGs can map to one OSD.
 
 A PG represents nothing but a grouping of objects; you configure the
-number of PGs you want (see
-http://ceph.com/wiki/Changing_the_number_of_PGs ), number of
-OSDs * 100 is a good starting point, and all of your stored objects
-are pseudo-randomly evenly distributed to the PGs. So a PG explicitly
-does NOT represent a fixed amount of storage; it represents 1/pg_num
-'th of the storage you happen to have on your OSDs.
+number of PGs you want, number of OSDs * 100 is a good starting point
+, and all of your stored objects are pseudo-randomly evenly distributed
+to the PGs. So a PG explicitly does NOT represent a fixed amount of
+storage; it represents 1/pg_num'th of the storage you happen to have
+on your OSDs.
 
 Ignoring the finer points of CRUSH and custom placement, it goes
 something like this in pseudocode::
@@ -101,9 +100,6 @@ User-visible PG States
 *replay*
   the PG is waiting for clients to replay operations after an OSD crashed
 
-*splitting*
-  the PG is being split into multiple PGs (not functional as of 2012-02)
-
 *scrubbing*
   the PG is being checked for inconsistencies
 
@@ -150,3 +146,9 @@ User-visible PG States
 *remapped*
   the PG is temporarily mapped to a different set of OSDs from what
   CRUSH specified
+
+*premerge*
+  the PG is in a quiesced-IO state due to an impending PG merge.  That
+  happens when pg_num_pending < pg_num, and applies to the PGs with
+  pg_num_pending <= ps < pg_num as well as the corresponding peer PG
+  that it is merging with.

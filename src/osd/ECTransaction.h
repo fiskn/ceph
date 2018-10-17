@@ -26,10 +26,10 @@ namespace ECTransaction {
   struct WritePlan {
     PGTransactionUPtr t;
     bool invalidates_cache = false; // Yes, both are possible
-    hobject_t::bitwisemap<extent_set> to_read;
-    hobject_t::bitwisemap<extent_set> will_write; // superset of to_read
+    map<hobject_t,extent_set> to_read;
+    map<hobject_t,extent_set> will_write; // superset of to_read
 
-    hobject_t::bitwisemap<ECUtil::HashInfoRef> hash_infos;
+    map<hobject_t,ECUtil::HashInfoRef> hash_infos;
   };
 
   bool requires_overwrite(
@@ -51,10 +51,6 @@ namespace ECTransaction {
 	uint64_t projected_size =
 	  hinfo->get_projected_total_logical_size(sinfo);
 
-	if (i.second.has_source()) {
-	  plan.invalidates_cache = true;
-	}
-
 	if (i.second.deletes_first()) {
 	  ldpp_dout(dpp, 20) << __func__ << ": delete, setting projected size"
 			     << " to 0" << dendl;
@@ -63,6 +59,8 @@ namespace ECTransaction {
 
 	hobject_t source;
 	if (i.second.has_source(&source)) {
+	  plan.invalidates_cache = true;
+
 	  ECUtil::HashInfoRef shinfo = get_hinfo(source);
 	  projected_size = shinfo->get_projected_total_logical_size(sinfo);
 	  plan.hash_infos[source] = shinfo;
@@ -91,13 +89,14 @@ namespace ECTransaction {
 	for (auto &&extent: i.second.buffer_updates) {
 	  using BufferUpdate = PGTransaction::ObjectOperation::BufferUpdate;
 	  if (boost::get<BufferUpdate::CloneRange>(&(extent.get_val()))) {
-	    assert(
+	    ceph_assert(
 	      0 ==
 	      "CloneRange is not allowed, do_op should have returned ENOTSUPP");
 	  }
 	  raw_write_set.insert(extent.get_off(), extent.get_len());
 	}
 
+	auto orig_size = projected_size;
 	for (auto extent = raw_write_set.begin();
 	     extent != raw_write_set.end();
 	     ++extent) {
@@ -109,9 +108,12 @@ namespace ECTransaction {
 	    head_start = projected_size;
 	  }
 	  if (head_start != head_finish &&
-	      head_start < projected_size) {
-	    assert(head_finish <= projected_size);
-	    assert(head_finish - head_start == sinfo.get_stripe_width());
+	      head_start < orig_size) {
+	    ceph_assert(head_finish <= orig_size);
+	    ceph_assert(head_finish - head_start == sinfo.get_stripe_width());
+	    ldpp_dout(dpp, 20) << __func__ << ": reading partial head stripe "
+			       << head_start << "~" << sinfo.get_stripe_width()
+			       << dendl;
 	    plan.to_read[i.first].union_insert(
 	      head_start, sinfo.get_stripe_width());
 	  }
@@ -124,15 +126,18 @@ namespace ECTransaction {
 	      extent.get_start() + extent.get_len());
 	  if (tail_start != tail_finish &&
 	      (head_start == head_finish || tail_start != head_start) &&
-	      tail_start < projected_size) {
-	    assert(tail_finish <= projected_size);
-	    assert(tail_finish - tail_start == sinfo.get_stripe_width());
+	      tail_start < orig_size) {
+	    ceph_assert(tail_finish <= orig_size);
+	    ceph_assert(tail_finish - tail_start == sinfo.get_stripe_width());
+	    ldpp_dout(dpp, 20) << __func__ << ": reading partial tail stripe "
+			       << tail_start << "~" << sinfo.get_stripe_width()
+			       << dendl;
 	    plan.to_read[i.first].union_insert(
 	      tail_start, sinfo.get_stripe_width());
 	  }
 
 	  if (head_start != tail_finish) {
-	    assert(
+	    ceph_assert(
 	      sinfo.logical_offset_is_stripe_aligned(
 		tail_finish - head_start)
 	      );
@@ -141,7 +146,7 @@ namespace ECTransaction {
 	    if (tail_finish > projected_size)
 	      projected_size = tail_finish;
 	  } else {
-	    assert(tail_finish <= projected_size);
+	    ceph_assert(tail_finish <= projected_size);
 	  }
 	}
 
@@ -152,7 +157,8 @@ namespace ECTransaction {
 	  ldpp_dout(dpp, 20) << __func__ << ": truncating out to "
 			     <<  truncating_to
 			     << dendl;
-	  will_write.union_insert(projected_size, truncating_to - projected_size);
+	  will_write.union_insert(projected_size,
+				  truncating_to - projected_size);
 	  projected_size = truncating_to;
 	}
 
@@ -168,7 +174,7 @@ namespace ECTransaction {
 	 * to_read should have an entry for i.first iff it isn't empty
 	 * and if we are reading from i.first, we can't be renaming or
 	 * cloning it */
-	assert(plan.to_read.count(i.first) == 0 ||
+	ceph_assert(plan.to_read.count(i.first) == 0 ||
 	       (!plan.to_read.at(i.first).empty() &&
 		!i.second.has_source()));
       });
@@ -180,14 +186,13 @@ namespace ECTransaction {
     WritePlan &plan,
     ErasureCodeInterfaceRef &ecimpl,
     pg_t pgid,
-    bool legacy_log_entries,
     const ECUtil::stripe_info_t &sinfo,
-    const hobject_t::bitwisemap<extent_map> &partial_extents,
+    const map<hobject_t,extent_map> &partial_extents,
     vector<pg_log_entry_t> &entries,
-    hobject_t::bitwisemap<extent_map> *written,
+    map<hobject_t,extent_map> *written,
     map<shard_id_t, ObjectStore::Transaction> *transactions,
-    set<hobject_t, hobject_t::BitwiseComparator> *temp_added,
-    set<hobject_t, hobject_t::BitwiseComparator> *temp_removed,
+    set<hobject_t> *temp_added,
+    set<hobject_t> *temp_removed,
     DoutPrefixProvider *dpp);
 };
 

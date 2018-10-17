@@ -6,8 +6,6 @@
 
 #include <boost/container/flat_map.hpp>
 
-#include <boost/container/flat_map.hpp>
-
 #include "rgw_lib.h"
 #include "rgw_file.h"
 
@@ -30,8 +28,15 @@ namespace rgw {
 		  RGWFrontendConfig* _conf) :
       RGWProcess(cct, pe, num_threads, _conf), gen(0), shutdown(false) {}
 
-    void run();
+    void run() override;
     void checkpoint();
+
+    void stop() {
+      shutdown = true;
+      for (const auto& fs: mounted_fs) {
+	fs.second->stop();
+      }
+    }
 
     void register_fs(RGWLibFS* fs) {
       lock_guard guard(mtx);
@@ -59,7 +64,7 @@ namespace rgw {
     } /* enqueue_req */
 
     /* "regular" requests */
-    void handle_request(RGWRequest* req); // async handler, deletes req
+    void handle_request(RGWRequest* req) override; // async handler, deletes req
     int process_request(RGWLibRequest* req);
     int process_request(RGWLibRequest* req, RGWLibIO* io);
     void set_access_key(RGWAccessKey& key) { access_key = key; }
@@ -74,7 +79,12 @@ namespace rgw {
     RGWLibFrontend(RGWProcessEnv& pe, RGWFrontendConfig *_conf)
       : RGWProcessFrontend(pe, _conf) {}
 		
-    int init();
+    int init() override;
+
+    void stop() override {
+      RGWProcessFrontend::stop();
+      get_process()->stop();
+    }
 
     RGWLibProcess* get_process() {
       return static_cast<RGWLibProcess*>(pprocess);

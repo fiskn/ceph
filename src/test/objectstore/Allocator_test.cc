@@ -5,6 +5,7 @@
  * Author: Ramesh Chander, Ramesh.Chander@sandisk.com
  */
 #include <iostream>
+#include <boost/scoped_ptr.hpp>
 #include <gtest/gtest.h>
 
 #include "common/Mutex.h"
@@ -13,36 +14,39 @@
 #include "include/stringify.h"
 #include "include/Context.h"
 #include "os/bluestore/Allocator.h"
-#include "os/bluestore/BitAllocator.h"
 
+#include <boost/random/uniform_int.hpp>
+typedef boost::mt11213b gen_type;
 
 #if GTEST_HAS_PARAM_TEST
 
 class AllocTest : public ::testing::TestWithParam<const char*> {
-public:
-    boost::scoped_ptr<Allocator> alloc;
-    AllocTest(): alloc(0) { }
-    void init_alloc(int64_t size, uint64_t min_alloc_size) {
-      std::cout << "Creating alloc type " << string(GetParam()) << " \n";
-      alloc.reset(Allocator::create(string(GetParam()), size, min_alloc_size));
-    }
 
-    void init_close() {
-      alloc.reset(0);
-    }
+public:
+  boost::scoped_ptr<Allocator> alloc;
+  AllocTest(): alloc(0) { }
+  void init_alloc(int64_t size, uint64_t min_alloc_size) {
+    std::cout << "Creating alloc type " << string(GetParam()) << " \n";
+    alloc.reset(Allocator::create(g_ceph_context, string(GetParam()), size,
+				  min_alloc_size));
+  }
+
+  void init_close() {
+    alloc.reset(0);
+  }
 };
 
 TEST_P(AllocTest, test_alloc_init)
 {
-  int64_t blocks = BmapEntry::size();
+  int64_t blocks = 64;
   init_alloc(blocks, 1);
   ASSERT_EQ(0U, alloc->get_free());
   alloc->shutdown(); 
-  blocks = BitMapZone::get_total_blocks() * 2 + 16;
+  blocks = 1024 * 2 + 16;
   init_alloc(blocks, 1);
   ASSERT_EQ(0U, alloc->get_free());
   alloc->shutdown(); 
-  blocks = BitMapZone::get_total_blocks() * 2;
+  blocks = 1024 * 2;
   init_alloc(blocks, 1);
   ASSERT_EQ(alloc->get_free(), (uint64_t) 0);
 }
@@ -50,19 +54,15 @@ TEST_P(AllocTest, test_alloc_init)
 TEST_P(AllocTest, test_alloc_min_alloc)
 {
   int64_t block_size = 1024;
-  int64_t blocks = BitMapZone::get_total_blocks() * 2 * block_size;
-  int count = 0;
-  uint64_t alloc_len = 0;
+  int64_t capacity = 4 * 1024 * block_size;
 
   {
-    init_alloc(blocks, block_size);
+    init_alloc(capacity, block_size);
+
     alloc->init_add_free(block_size, block_size);
-    EXPECT_EQ(alloc->reserve(block_size), 0);
-    AllocExtentVector extents = AllocExtentVector 
-                        (1, AllocExtent(0, 0));
-    EXPECT_EQ(alloc->allocate(block_size, block_size, 
-                                   0, (int64_t) 0, &extents, &count, &alloc_len), 0);
-    EXPECT_EQ(alloc_len, (uint64_t) block_size);
+    PExtentVector extents;
+    EXPECT_EQ(block_size, alloc->allocate(block_size, block_size,
+					  0, (int64_t) 0, &extents));
   }
 
   /*
@@ -70,16 +70,12 @@ TEST_P(AllocTest, test_alloc_min_alloc)
    */   
   {
     alloc->init_add_free(0, block_size * 4);
-    EXPECT_EQ(alloc->reserve(block_size * 4), 0);
-    AllocExtentVector extents = AllocExtentVector 
-                        (4, AllocExtent(0, 0));
-  
-    EXPECT_EQ(alloc->allocate(4 * (uint64_t)block_size, (uint64_t) block_size, 
-                                   0, (int64_t) 0, &extents, &count, &alloc_len), 0);
-    EXPECT_EQ(alloc_len, 4 * (uint64_t) block_size);
+    PExtentVector extents;
+    EXPECT_EQ(4*block_size,
+	      alloc->allocate(4 * (uint64_t)block_size, (uint64_t) block_size,
+			      0, (int64_t) 0, &extents));
+    EXPECT_EQ(1u, extents.size());
     EXPECT_EQ(extents[0].length, 4 * block_size);
-    EXPECT_EQ(0U, extents[1].length);
-    EXPECT_EQ(count, 1);
   }
 
   /*
@@ -88,17 +84,14 @@ TEST_P(AllocTest, test_alloc_min_alloc)
   {
     alloc->init_add_free(0, block_size * 2);
     alloc->init_add_free(3 * block_size, block_size * 2);
-    EXPECT_EQ(alloc->reserve(block_size * 4), 0);
-    AllocExtentVector extents = AllocExtentVector 
-                        (4, AllocExtent(0, 0));
+    PExtentVector extents;
   
-    EXPECT_EQ(alloc->allocate(4 * (uint64_t)block_size, (uint64_t) block_size, 
-                                   0, (int64_t) 0, &extents, &count, &alloc_len), 0);
-    EXPECT_EQ(alloc_len, 4 * (uint64_t) block_size);
+    EXPECT_EQ(4*block_size,
+	      alloc->allocate(4 * (uint64_t)block_size, (uint64_t) block_size,
+			      0, (int64_t) 0, &extents));
+    EXPECT_EQ(2u, extents.size());
     EXPECT_EQ(extents[0].length, 2 * block_size);
     EXPECT_EQ(extents[1].length, 2 * block_size);
-    EXPECT_EQ(0U, extents[2].length);
-    EXPECT_EQ(count, 2);
   }
   alloc->shutdown();
 }
@@ -106,11 +99,9 @@ TEST_P(AllocTest, test_alloc_min_alloc)
 TEST_P(AllocTest, test_alloc_min_max_alloc)
 {
   int64_t block_size = 1024;
-  int64_t blocks = BitMapZone::get_total_blocks() * 2 * block_size;
-  int count = 0;
-  uint64_t alloc_len = 0;
 
-  init_alloc(blocks, block_size);
+  int64_t capacity = 4 * 1024 * block_size;
+  init_alloc(capacity, block_size);
 
   /*
    * Make sure we get all extents different when
@@ -118,17 +109,14 @@ TEST_P(AllocTest, test_alloc_min_max_alloc)
    */
   {
     alloc->init_add_free(0, block_size * 4);
-    EXPECT_EQ(alloc->reserve(block_size * 4), 0);
-    AllocExtentVector extents = AllocExtentVector 
-                        (4, AllocExtent(0, 0));
-  
-    EXPECT_EQ(alloc->allocate(4 * (uint64_t)block_size, (uint64_t) block_size, 
-                                   block_size, (int64_t) 0, &extents, &count, &alloc_len), 0);
-    EXPECT_EQ(alloc_len, 4 * (uint64_t) block_size);
-    for (int i = 0; i < 4; i++) {
-      EXPECT_EQ(extents[i].length, block_size);
+    PExtentVector extents;
+    EXPECT_EQ(4*block_size,
+	      alloc->allocate(4 * (uint64_t)block_size, (uint64_t) block_size,
+			      block_size, (int64_t) 0, &extents));
+    for (auto e : extents) {
+      EXPECT_EQ(e.length, block_size);
     }
-    EXPECT_EQ(count, 4);
+    EXPECT_EQ(4u, extents.size());
   }
 
 
@@ -138,17 +126,14 @@ TEST_P(AllocTest, test_alloc_min_max_alloc)
    */
   {
     alloc->init_add_free(0, block_size * 4);
-    EXPECT_EQ(alloc->reserve(block_size * 4), 0);
-    AllocExtentVector extents = AllocExtentVector 
-                        (2, AllocExtent(0, 0));
-  
-    EXPECT_EQ(alloc->allocate(4 * (uint64_t)block_size, (uint64_t) block_size, 
-                                   2 * block_size, (int64_t) 0, &extents, &count, &alloc_len), 0);
-    EXPECT_EQ(alloc_len, 4 * (uint64_t) block_size);
-    for (int i = 0; i < 2; i++) {
-      EXPECT_EQ(extents[i].length, block_size * 2);
+    PExtentVector extents;
+    EXPECT_EQ(4*block_size,
+	      alloc->allocate(4 * (uint64_t)block_size, (uint64_t) block_size,
+			      2 * block_size, (int64_t) 0, &extents));
+    EXPECT_EQ(2u, extents.size());
+    for (auto& e : extents) {
+      EXPECT_EQ(e.length, block_size * 2);
     }
-    EXPECT_EQ(count, 2);
   }
 
   /*
@@ -156,18 +141,15 @@ TEST_P(AllocTest, test_alloc_min_max_alloc)
    */
   {
     alloc->init_add_free(0, block_size * 1024);
-    EXPECT_EQ(alloc->reserve(block_size * 1024), 0);
-    AllocExtentVector extents = AllocExtentVector 
-                        (1024, AllocExtent(0, 0));
-  
-    EXPECT_EQ(alloc->allocate(1024 * (uint64_t)block_size, (uint64_t) block_size * 4, 
-                                   block_size * 4, (int64_t) 0, &extents, &count, &alloc_len), 0);
- 
-    EXPECT_EQ(alloc_len, 1024 * (uint64_t) block_size);
-    for (int i = 0; i < count; i++) {
-      EXPECT_EQ(extents[i].length, block_size * 4);
+    PExtentVector extents;
+    EXPECT_EQ(1024 * block_size,
+	      alloc->allocate(1024 * (uint64_t)block_size,
+			      (uint64_t) block_size * 4,
+			      block_size * 4, (int64_t) 0, &extents));
+    for (auto& e : extents) {
+      EXPECT_EQ(e.length, block_size * 4);
     }
-    EXPECT_EQ(count, 1024 / 4);
+    EXPECT_EQ(1024u/4, extents.size());
   }
 
   /*
@@ -175,97 +157,166 @@ TEST_P(AllocTest, test_alloc_min_max_alloc)
    */
   {
     alloc->init_add_free(0, block_size * 16);
-    EXPECT_EQ(alloc->reserve(block_size * 16), 0);
-    AllocExtentVector extents = AllocExtentVector 
-                        (8, AllocExtent(0, 0));
-  
-    EXPECT_EQ(alloc->allocate(16 * (uint64_t)block_size, (uint64_t) block_size, 
-                                   2 * block_size, (int64_t) 0, &extents, &count, &alloc_len), 0);
+    PExtentVector extents;
+    EXPECT_EQ(16 * block_size,
+	      alloc->allocate(16 * (uint64_t)block_size, (uint64_t) block_size,
+			      2 * block_size, (int64_t) 0, &extents));
 
-    EXPECT_EQ(count, 8);
-    EXPECT_EQ(alloc_len, 16 * (uint64_t) block_size);
-    for (int i = 0; i < 8; i++) {
-      EXPECT_EQ(extents[i].length, 2 * block_size);
+    EXPECT_EQ(extents.size(), 8u);
+    for (auto& e : extents) {
+      EXPECT_EQ(e.length, 2 * block_size);
     }
-    EXPECT_EQ(alloc->release_extents(&extents, count), 0);
   }
 }
 
 TEST_P(AllocTest, test_alloc_failure)
 {
   int64_t block_size = 1024;
-  int64_t blocks = BitMapZone::get_total_blocks() * block_size;
-  int count = 0;
-  uint64_t alloc_len = 0;
+  int64_t capacity = 4 * 1024 * block_size;
 
-  init_alloc(blocks, block_size);
+  init_alloc(capacity, block_size);
   {
     alloc->init_add_free(0, block_size * 256);
     alloc->init_add_free(block_size * 512, block_size * 256);
 
-    EXPECT_EQ(alloc->reserve(block_size * 512), 0);
-    AllocExtentVector extents = AllocExtentVector 
-                        (4, AllocExtent(0, 0));
-  
-    EXPECT_EQ(alloc->allocate(512 * (uint64_t)block_size, (uint64_t) block_size * 256, 
-                                   block_size * 256, (int64_t) 0, &extents, &count, &alloc_len), 0);
-    EXPECT_EQ(512 * (uint64_t)block_size, alloc_len);
+    PExtentVector extents;
+    EXPECT_EQ(512 * block_size,
+	      alloc->allocate(512 * (uint64_t)block_size,
+			      (uint64_t) block_size * 256,
+			      block_size * 256, (int64_t) 0, &extents));
     alloc->init_add_free(0, block_size * 256);
     alloc->init_add_free(block_size * 512, block_size * 256);
-    EXPECT_EQ(alloc->reserve(block_size * 512), 0);
-    EXPECT_EQ(alloc->allocate(512 * (uint64_t)block_size, (uint64_t) block_size * 512,
-                                   block_size * 512, (int64_t) 0, &extents, &count, &alloc_len), -ENOSPC);
-    EXPECT_EQ(alloc_len, (uint64_t) 0);
+    extents.clear();
+    EXPECT_EQ(-ENOSPC,
+	      alloc->allocate(512 * (uint64_t)block_size,
+			      (uint64_t) block_size * 512,
+			      block_size * 512, (int64_t) 0, &extents));
   }
 }
 
-TEST_P(AllocTest, test_alloc_hint_bmap)
+TEST_P(AllocTest, test_alloc_big)
 {
-  if (GetParam() == std::string("stupid")) {
-    return;
+  int64_t block_size = 4096;
+  int64_t blocks = 104857600;
+  int64_t mas = 4096;
+  init_alloc(blocks*block_size, block_size);
+  alloc->init_add_free(2*block_size, (blocks-2)*block_size);
+  for (int64_t big = mas; big < 1048576*128; big*=2) {
+    cout << big << std::endl;
+    PExtentVector extents;
+    EXPECT_EQ(big,
+	      alloc->allocate(big, mas, 0, &extents));
   }
-  int64_t blocks = BitMapArea::get_level_factor(2) * 4;
-  int count = 0;
-  int64_t allocated = 0;
-  int64_t zone_size = 1024;
-  uint64_t alloc_len = 0;
-  g_conf->set_val("bluestore_bitmapallocator_blocks_per_zone", std::to_string(zone_size));
-
-  init_alloc(blocks, 1);
-  alloc->init_add_free(0, blocks);
-
-  auto extents = AllocExtentVector
-          (zone_size * 4, AllocExtent(-1, -1));
-  alloc->reserve(blocks);
-
-  allocated = alloc->allocate(1, 1, 1, zone_size, &extents, &count, &alloc_len);
-  ASSERT_EQ(0, allocated);
-  ASSERT_EQ((uint64_t) 1, alloc_len);
-  ASSERT_EQ(1, count);
-  ASSERT_EQ(extents[0].offset, (uint64_t) zone_size);
-
-  allocated = alloc->allocate(1, 1, 1, zone_size * 2 - 1, &extents, &count, &alloc_len);
-  ASSERT_EQ((uint64_t) 1, alloc_len);
-  EXPECT_EQ(0, allocated);
-  ASSERT_EQ(1, count);
-  EXPECT_EQ((int64_t) extents[0].offset, zone_size * 2 - 1);
-
-  /*
-   * Wrap around with hint
-   */
-  allocated = alloc->allocate(zone_size * 2, 1, 1,  blocks - zone_size * 2, &extents, &count, &alloc_len);
-  EXPECT_EQ(0, allocated);
-  ASSERT_EQ((uint64_t) zone_size * 2, alloc_len);
-  EXPECT_EQ(zone_size * 2, count);
-  EXPECT_EQ((int64_t)extents[0].offset, blocks - zone_size * 2);
-
-  allocated = alloc->allocate(zone_size, 1, 1, blocks - zone_size, &extents, &count, &alloc_len);
-  EXPECT_EQ(0, allocated);
-  ASSERT_EQ((uint64_t) zone_size, alloc_len);
-  EXPECT_EQ(zone_size, count);
-  EXPECT_EQ(extents[0].offset, (uint64_t) 0);
 }
 
+TEST_P(AllocTest, test_alloc_non_aligned_len)
+{
+  int64_t block_size = 1 << 12;
+  int64_t blocks = (1 << 20) * 100;
+  int64_t want_size = 1 << 22;
+  int64_t alloc_unit = 1 << 20;
+  
+  init_alloc(blocks*block_size, block_size);
+  alloc->init_add_free(0, 2097152);
+  alloc->init_add_free(2097152, 1064960);
+  alloc->init_add_free(3670016, 2097152);
+
+  PExtentVector extents;
+  EXPECT_EQ(want_size, alloc->allocate(want_size, alloc_unit, 0, &extents));
+}
+
+TEST_P(AllocTest, test_alloc_fragmentation)
+{
+  uint64_t capacity = 4 * 1024 * 1024;
+  uint64_t alloc_unit = 4096;
+  uint64_t want_size = alloc_unit;
+  PExtentVector allocated, tmp;
+  
+  init_alloc(capacity, alloc_unit);
+  alloc->init_add_free(0, capacity);
+  bool bitmap_alloc = GetParam() == std::string("bitmap");
+  
+  EXPECT_EQ(0.0, alloc->get_fragmentation(alloc_unit));
+
+  for (size_t i = 0; i < capacity / alloc_unit; ++i)
+  {
+    tmp.clear();
+    EXPECT_EQ(static_cast<int64_t>(want_size),
+	      alloc->allocate(want_size, alloc_unit, 0, 0, &tmp));
+    allocated.insert(allocated.end(), tmp.begin(), tmp.end());
+
+    // bitmap fragmentation calculation doesn't provide such constant
+    // estimate
+    if (!bitmap_alloc) {
+      EXPECT_EQ(0.0, alloc->get_fragmentation(alloc_unit));
+    }
+  }
+  EXPECT_EQ(-ENOSPC, alloc->allocate(want_size, alloc_unit, 0, 0, &tmp));
+
+  for (size_t i = 0; i < allocated.size(); i += 2)
+  {
+    interval_set<uint64_t> release_set;
+    release_set.insert(allocated[i].offset, allocated[i].length);
+    alloc->release(release_set);
+  }
+  EXPECT_EQ(1.0, alloc->get_fragmentation(alloc_unit));
+  for (size_t i = 1; i < allocated.size() / 2; i += 2)
+  {
+    interval_set<uint64_t> release_set;
+    release_set.insert(allocated[i].offset, allocated[i].length);
+    alloc->release(release_set);
+  }
+  if (bitmap_alloc) {
+    // fragmentation = one l1 slot is free + one l1 slot is partial
+    EXPECT_EQ(50U, uint64_t(alloc->get_fragmentation(alloc_unit) * 100));
+  } else {
+    // fragmentation approx = 257 intervals / 768 max intervals
+    EXPECT_EQ(33u, uint64_t(alloc->get_fragmentation(alloc_unit) * 100));
+  }
+
+  for (size_t i = allocated.size() / 2 + 1; i < allocated.size(); i += 2)
+  {
+    interval_set<uint64_t> release_set;
+    release_set.insert(allocated[i].offset, allocated[i].length);
+    alloc->release(release_set);
+  }
+  // doing some rounding trick as stupid allocator doesn't merge all the 
+  // extents that causes some minor fragmentation (minor bug or by-design behavior?).
+  // Hence leaving just two 
+  // digits after decimal point due to this.
+  EXPECT_EQ(0u, uint64_t(alloc->get_fragmentation(alloc_unit) * 100));
+}
+
+TEST_P(AllocTest, test_alloc_bug_24598)
+{
+  if (string(GetParam()) != "bitmap")
+    return;
+  
+  uint64_t capacity = 0x2625a0000ull;
+  uint64_t alloc_unit = 0x4000;
+  uint64_t want_size = 0x200000;
+  PExtentVector allocated, tmp;
+
+  init_alloc(capacity, alloc_unit);
+
+  alloc->init_add_free(0x4800000, 0x100000);
+  alloc->init_add_free(0x4a00000, 0x100000);
+
+  alloc->init_rm_free(0x4800000, 0x100000);
+  alloc->init_rm_free(0x4a00000, 0x100000);
+
+  alloc->init_add_free(0x3f00000, 0x500000);
+  alloc->init_add_free(0x4500000, 0x100000);
+  alloc->init_add_free(0x4700000, 0x100000);
+  alloc->init_add_free(0x4900000, 0x100000);
+  alloc->init_add_free(0x4b00000, 0x200000);
+
+  EXPECT_EQ(static_cast<int64_t>(want_size),
+	    alloc->allocate(want_size, 0x100000, 0, 0, &tmp));
+  EXPECT_EQ(0x4b00000u, tmp[0].offset);
+  EXPECT_EQ(0x200000u, tmp[0].length);
+  EXPECT_EQ(1u, tmp.size());
+}
 
 INSTANTIATE_TEST_CASE_P(
   Allocator,

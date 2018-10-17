@@ -5,7 +5,6 @@ set(jerasure_utils_src
   ErasureCodeJerasure.cc)
 
 add_library(jerasure_utils OBJECT ${jerasure_utils_src})
-add_dependencies(jerasure_utils ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
 
 # Set the CFLAGS correctly for gf-complete based on SIMD compiler support
 set(GF_COMPILE_FLAGS)
@@ -88,6 +87,8 @@ set(ec_jerasure_objs
   $<TARGET_OBJECTS:erasure_code_objs>)
 
 add_library(ec_jerasure SHARED ${ec_jerasure_objs})
+set_target_properties(ec_jerasure PROPERTIES
+  INSTALL_RPATH "")
 target_link_libraries(ec_jerasure ${EXTRALIBS})
 install(TARGETS ec_jerasure DESTINATION ${erasure_plugin_dir})
 
@@ -95,14 +96,8 @@ install(TARGETS ec_jerasure DESTINATION ${erasure_plugin_dir})
 foreach(flavor ${jerasure_legacy_flavors})
   set(plugin_name "ec_jerasure_${flavor}")
   add_library(${plugin_name} SHARED ${ec_jerasure_objs})
+  set_target_properties(${plugin_name} PROPERTIES
+    INSTALL_RPATH "")
   install(TARGETS ${plugin_name} DESTINATION ${erasure_plugin_dir})
   add_dependencies(ec_jerasure ${plugin_name})
 endforeach()
-
-if(WITH_EMBEDDED)
-  add_library(cephd_ec_jerasure STATIC
-    $<TARGET_OBJECTS:gf-complete_objs>
-    $<TARGET_OBJECTS:jerasure_objs>
-    ${jerasure_utils_src})
-  set_target_properties(cephd_ec_jerasure PROPERTIES COMPILE_DEFINITIONS BUILDING_FOR_EMBEDDED)
-endif()

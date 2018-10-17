@@ -15,7 +15,6 @@
 
 #define dout_subsys ceph_subsys_rgw
 
-using namespace std;
 
 void RGWAccessControlList::_add_grant(ACLGrant *grant)
 {
@@ -24,6 +23,12 @@ void RGWAccessControlList::_add_grant(ACLGrant *grant)
   switch (type.get_type()) {
   case ACL_TYPE_REFERER:
     referer_list.emplace_back(grant->get_referer(), perm.get_permissions());
+
+    /* We're specially handling the Swift's .r:* as the S3 API has a similar
+     * concept and thus we can have a small portion of compatibility here. */
+     if (grant->get_referer() == RGW_REFERER_WILDCARD) {
+       acl_group_map[ACL_GROUP_ALL_USERS] |= perm.get_permissions();
+     }
     break;
   case ACL_TYPE_GROUP:
     acl_group_map[grant->get_group()] |= perm.get_permissions();
@@ -47,13 +52,14 @@ void RGWAccessControlList::add_grant(ACLGrant *grant)
   _add_grant(grant);
 }
 
-uint32_t RGWAccessControlList::get_perm(const RGWIdentityApplier& auth_identity,
+uint32_t RGWAccessControlList::get_perm(const DoutPrefixProvider* dpp, 
+                                        const rgw::auth::Identity& auth_identity,
                                         const uint32_t perm_mask)
 {
-  ldout(cct, 5) << "Searching permissions for identity=" << auth_identity
+  ldpp_dout(dpp, 5) << "Searching permissions for identity=" << auth_identity
                 << " mask=" << perm_mask << dendl;
 
-  return perm_mask & auth_identity.get_perms_from_aclspec(acl_user_map);
+  return perm_mask & auth_identity.get_perms_from_aclspec(dpp, acl_user_map);
 }
 
 uint32_t RGWAccessControlList::get_group_perm(ACLGroupTypeEnum group,
@@ -71,34 +77,37 @@ uint32_t RGWAccessControlList::get_group_perm(ACLGroupTypeEnum group,
   return 0;
 }
 
-uint32_t RGWAccessControlList::get_referer_perm(const std::string http_referer,
+uint32_t RGWAccessControlList::get_referer_perm(const uint32_t current_perm,
+                                                const std::string http_referer,
                                                 const uint32_t perm_mask)
 {
   ldout(cct, 5) << "Searching permissions for referer=" << http_referer
                 << " mask=" << perm_mask << dendl;
 
-  /* FIXME: C++11 doesn't have std::rbegin nor std::rend. We would like to
-   * switch when C++14 becomes available. */
-  const auto iter = std::find_if(referer_list.crbegin(), referer_list.crend(),
-    [&http_referer](const ACLReferer& r) -> bool {
-      return r.is_match(http_referer);
+  /* This function is basically a transformation from current perm to
+   * a new one that takes into consideration the Swift's HTTP referer-
+   * based ACLs. We need to go through all items to respect negative
+   * grants. */
+  uint32_t referer_perm = current_perm;
+  for (const auto& r : referer_list) {
+    if (r.is_match(http_referer)) {
+       referer_perm = r.perm;
     }
-  );
-
-  if (referer_list.crend() == iter) {
-    ldout(cct, 5) << "Permissions for referer not found" << dendl;
-    return 0;
-  } else {
-    ldout(cct, 5) << "Found referer permission=" << iter->perm << dendl;
-    return iter->perm & perm_mask;
   }
+
+  ldout(cct, 5) << "Found referer permission=" << referer_perm << dendl;
+  return referer_perm & perm_mask;
 }
 
-uint32_t RGWAccessControlPolicy::get_perm(const RGWIdentityApplier& auth_identity,
+uint32_t RGWAccessControlPolicy::get_perm(const DoutPrefixProvider* dpp,
+                                          const rgw::auth::Identity& auth_identity,
                                           const uint32_t perm_mask,
                                           const char * const http_referer)
 {
-  uint32_t perm = acl.get_perm(auth_identity, perm_mask);
+  ldpp_dout(dpp, 20) << "-- Getting permissions begin with perm_mask=" << perm_mask
+                 << dendl;
+
+  uint32_t perm = acl.get_perm(dpp, auth_identity, perm_mask);
 
   if (auth_identity.is_owner_of(owner.get_id())) {
     perm |= perm_mask & (RGW_PERM_READ_ACP | RGW_PERM_WRITE_ACP);
@@ -120,24 +129,25 @@ uint32_t RGWAccessControlPolicy::get_perm(const RGWIdentityApplier& auth_identit
 
   /* Should we continue looking up even deeper? */
   if (nullptr != http_referer && (perm & perm_mask) != perm_mask) {
-    perm |= acl.get_referer_perm(http_referer, perm_mask);
+    perm = acl.get_referer_perm(perm, http_referer, perm_mask);
   }
 
-  ldout(cct, 5) << "Getting permissions identity=" << auth_identity
-                << " owner=" << owner.get_id()
-                << " perm=" << perm << dendl;
+  ldpp_dout(dpp, 5) << "-- Getting permissions done for identity=" << auth_identity
+                << ", owner=" << owner.get_id()
+                << ", perm=" << perm << dendl;
 
   return perm;
 }
 
-bool RGWAccessControlPolicy::verify_permission(const RGWIdentityApplier& auth_identity,
+bool RGWAccessControlPolicy::verify_permission(const DoutPrefixProvider* dpp,
+                                               const rgw::auth::Identity& auth_identity,
                                                const uint32_t user_perm_mask,
                                                const uint32_t perm,
                                                const char * const http_referer)
 {
   uint32_t test_perm = perm | RGW_PERM_READ_OBJS | RGW_PERM_WRITE_OBJS;
 
-  uint32_t policy_perm = get_perm(auth_identity, test_perm, http_referer);
+  uint32_t policy_perm = get_perm(dpp, auth_identity, test_perm, http_referer);
 
   /* the swift WRITE_OBJS perm is equivalent to the WRITE obj, just
      convert those bits. Note that these bits will only be set on
@@ -152,7 +162,7 @@ bool RGWAccessControlPolicy::verify_permission(const RGWIdentityApplier& auth_id
    
   uint32_t acl_perm = policy_perm & perm & user_perm_mask;
 
-  ldout(cct, 10) << " identity=" << auth_identity
+  ldpp_dout(dpp, 10) << " identity=" << auth_identity
                  << " requested perm (type)=" << perm
                  << ", policy perm=" << policy_perm
                  << ", user_perm_mask=" << user_perm_mask

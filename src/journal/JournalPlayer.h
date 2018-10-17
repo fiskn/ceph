@@ -65,10 +65,10 @@ private:
     C_Fetch(JournalPlayer *p, uint64_t o) : player(p), object_num(o) {
       player->m_async_op_tracker.start_op();
     }
-    virtual ~C_Fetch() {
+    ~C_Fetch() override {
       player->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       player->handle_fetched(object_num, r);
     }
   };
@@ -80,11 +80,11 @@ private:
       : player(player), object_num(object_num) {
       player->m_async_op_tracker.start_op();
     }
-    virtual ~C_Watch() {
+    ~C_Watch() override {
       player->m_async_op_tracker.finish_op();
     }
 
-    virtual void finish(int r) override {
+    void finish(int r) override {
       player->handle_watch(object_num, r);
     }
   };
@@ -119,7 +119,7 @@ private:
   bool m_commit_position_valid = false;
   ObjectPosition m_commit_position;
   SplayedObjectPositions m_commit_positions;
-  uint64_t m_active_set;
+  uint64_t m_active_set = 0;
 
   boost::optional<uint64_t> m_active_tag_tid = boost::none;
   boost::optional<uint64_t> m_prune_tag_tid = boost::none;

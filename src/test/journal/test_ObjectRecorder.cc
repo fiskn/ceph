@@ -31,12 +31,12 @@ public:
     Handler() : lock("lock") {
     }
 
-    virtual void closed(journal::ObjectRecorder *object_recorder) {
+    void closed(journal::ObjectRecorder *object_recorder) override {
       Mutex::Locker locker(lock);
       is_closed = true;
       cond.Signal();
     }
-    virtual void overflow(journal::ObjectRecorder *object_recorder) {
+    void overflow(journal::ObjectRecorder *object_recorder) override {
       Mutex::Locker locker(lock);
       journal::AppendBuffers append_buffers;
       object_lock->Lock();
@@ -57,9 +57,10 @@ public:
   uint32_t m_flush_interval;
   uint64_t m_flush_bytes;
   double m_flush_age;
+  uint64_t m_max_in_flight_appends = 0;
   Handler m_handler;
 
-  void TearDown() {
+  void TearDown() override {
     for (ObjectRecorders::iterator it = m_object_recorders.begin();
          it != m_object_recorders.end(); ++it) {
       C_SaferCond cond;
@@ -96,7 +97,8 @@ public:
                                            uint8_t order, shared_ptr<Mutex> lock) {
     journal::ObjectRecorderPtr object(new journal::ObjectRecorder(
       m_ioctx, oid, 0, lock, m_work_queue, *m_timer, m_timer_lock, &m_handler,
-      order, m_flush_interval, m_flush_bytes, m_flush_age));
+      order, m_flush_interval, m_flush_bytes, m_flush_age,
+      m_max_in_flight_appends));
     m_object_recorders.push_back(object);
     m_object_recorder_locks.insert(std::make_pair(oid, lock));
     m_handler.object_lock = lock;
@@ -372,7 +374,6 @@ TEST_F(TestObjectRecorder, Close) {
     Mutex::Locker locker(m_handler.lock);
     while (!m_handler.is_closed) {
       if (m_handler.cond.WaitInterval(
-            reinterpret_cast<CephContext*>(m_ioctx.cct()),
             m_handler.lock, utime_t(10, 0)) != 0) {
         break;
       }
@@ -423,7 +424,6 @@ TEST_F(TestObjectRecorder, Overflow) {
     Mutex::Locker locker(m_handler.lock);
     while (m_handler.overflows == 0) {
       if (m_handler.cond.WaitInterval(
-            reinterpret_cast<CephContext*>(m_ioctx.cct()),
             m_handler.lock, utime_t(10, 0)) != 0) {
         break;
       }

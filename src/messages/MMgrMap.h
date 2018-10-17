@@ -19,7 +19,10 @@
 #include "msg/Message.h"
 #include "mon/MgrMap.h"
 
-class MMgrMap : public Message {
+class MMgrMap : public MessageInstance<MMgrMap> {
+public:
+  friend factory;
+
 protected:
   MgrMap map;
 
@@ -27,27 +30,28 @@ public:
   const MgrMap & get_map() {return map;}
 
   MMgrMap() : 
-    Message(MSG_MGR_MAP) {}
+    MessageInstance(MSG_MGR_MAP) {}
   MMgrMap(const MgrMap &map_) :
-    Message(MSG_MGR_MAP), map(map_)
+    MessageInstance(MSG_MGR_MAP), map(map_)
   {
   }
 
 private:
-  ~MMgrMap() {}
+  ~MMgrMap() override {}
 
 public:
-  const char *get_type_name() const { return "mgrmap"; }
-  void print(ostream& out) const {
+  const char *get_type_name() const override { return "mgrmap"; }
+  void print(ostream& out) const override {
     out << get_type_name() << "(e " << map.epoch << ")";
   }
 
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
-    ::decode(map, p);
+  void decode_payload() override {
+    auto p = payload.cbegin();
+    decode(map, p);
   }
-  void encode_payload(uint64_t features) {
-    ::encode(map, payload, features);
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
+    encode(map, payload, features);
   }
 };
 

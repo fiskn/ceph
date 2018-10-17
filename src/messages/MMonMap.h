@@ -19,21 +19,23 @@
 #include "msg/Message.h"
 #include "mon/MonMap.h"
 
-class MMonMap : public Message {
+class MMonMap : public MessageInstance<MMonMap> {
 public:
+  friend factory;
+
   bufferlist monmapbl;
 
-  MMonMap() : Message(CEPH_MSG_MON_MAP) { }
-  explicit MMonMap(bufferlist &bl) : Message(CEPH_MSG_MON_MAP) { 
+  MMonMap() : MessageInstance(CEPH_MSG_MON_MAP) { }
+  explicit MMonMap(bufferlist &bl) : MessageInstance(CEPH_MSG_MON_MAP) { 
     monmapbl.claim(bl);
   }
 private:
-  ~MMonMap() {}
+  ~MMonMap() override {}
 
 public:
-  const char *get_type_name() const { return "mon_map"; }
+  const char *get_type_name() const override { return "mon_map"; }
 
-  void encode_payload(uint64_t features) { 
+  void encode_payload(uint64_t features) override { 
     if (monmapbl.length() &&
 	((features & CEPH_FEATURE_MONENC) == 0 ||
 	 (features & CEPH_FEATURE_MSG_ADDR2) == 0)) {
@@ -44,11 +46,12 @@ public:
       t.encode(monmapbl, features);
     }
 
-    ::encode(monmapbl, payload);
+    using ceph::encode;
+    encode(monmapbl, payload);
   }
-  void decode_payload() { 
-    bufferlist::iterator p = payload.begin();
-    ::decode(monmapbl, p);
+  void decode_payload() override { 
+    auto p = payload.cbegin();
+    decode(monmapbl, p);
   }
 };
 

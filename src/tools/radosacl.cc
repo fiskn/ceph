@@ -41,7 +41,7 @@ struct ACLID {
   void encode(bufferlist& bl) const {
     bl.append((const char *)id, ID_SIZE);
   }
-  void decode(bufferlist::iterator& iter) {
+  void decode(bufferlist::const_iterator& iter) {
     iter.copy(ID_SIZE, (char *)id);
   }
 };
@@ -66,10 +66,12 @@ class ObjectACLs {
 public:
 
   void encode(bufferlist& bl) const {
-    ::encode(acls_map, bl);
+    using ceph::encode;
+    encode(acls_map, bl);
   }
-  void decode(bufferlist::iterator& bl) {
-    ::decode(acls_map, bl);
+  void decode(bufferlist::const_iterator& bl) {
+    using ceph::decode;
+    decode(acls_map, bl);
   }
 
   int read_acl(ACLID& id, ACLFlags *flags);
@@ -151,7 +153,7 @@ int main(int argc, const char **argv)
 
   ACLID id;
 
-  snprintf(id.id, ID_SIZE + 1, "%.16x", 0x1234);
+  snprintf(id.id, sizeof(id.id), "%.8x", 0x1234);
   cout << "id=" << id.id << std::endl;
 
   r = io_ctx.exec(oid, "acl", "get", bl, bl2);
@@ -159,7 +161,7 @@ int main(int argc, const char **argv)
        << " len=" << bl2.length() << std::endl;
   ObjectACLs oa;
   if (r >= 0) {
-    bufferlist::iterator iter = bl2.begin();
+    auto iter = bl2.cbegin();
     oa.decode(iter);
   }
 

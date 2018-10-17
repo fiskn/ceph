@@ -10,9 +10,6 @@
 #include <include/types.h>
 #include <common/Formatter.h>
 
-using namespace std;
-
-
 class XMLObj;
 
 class XMLObjIter {
@@ -75,10 +72,10 @@ protected:
   }
 public:
   RGWXMLParser();
-  virtual ~RGWXMLParser();
+  ~RGWXMLParser() override;
   bool init();
   bool xml_start(const char *el, const char **attr);
-  bool xml_end(const char *el);
+  bool xml_end(const char *el) override;
   void handle_data(const char *s, int len);
 
   bool parse(const char *buf, int len, int done);
@@ -100,7 +97,7 @@ public:
   class XMLParser : public RGWXMLParser {
   public:
     XMLParser() {}
-    virtual ~XMLParser() {}
+    ~XMLParser() override {}
   } parser;
 
   explicit RGWXMLDecoder(bufferlist& bl) {
@@ -261,7 +258,6 @@ void encode_xml(const char *name, unsigned long val, ceph::Formatter *f);
 void encode_xml(const char *name, long long val, ceph::Formatter *f);
 void encode_xml(const char *name, const utime_t& val, ceph::Formatter *f);
 void encode_xml(const char *name, const bufferlist& bl, ceph::Formatter *f);
-void encode_xml(const char *name, long long val, ceph::Formatter *f);
 void encode_xml(const char *name, long long unsigned val, ceph::Formatter *f);
 
 template<class T>

@@ -17,11 +17,11 @@
 
 #include <map>
 #include <set>
-using namespace std;
 
 #include "include/types.h"
 #include "PaxosService.h"
 
+#include "common/config_fwd.h"
 #include "common/LogEntry.h"
 #include "include/str_map.h"
 
@@ -130,23 +130,23 @@ private:
 
   void update_log_channels();
 
-  void create_initial();
-  void update_from_paxos(bool *need_bootstrap);
-  void create_pending();  // prepare a new pending
+  void create_initial() override;
+  void update_from_paxos(bool *need_bootstrap) override;
+  void create_pending() override;  // prepare a new pending
   // propose pending update to peers
-  void encode_pending(MonitorDBStore::TransactionRef t);
-  virtual void encode_full(MonitorDBStore::TransactionRef t);
-  version_t get_trim_to();
-  bool preprocess_query(MonOpRequestRef op);  // true if processed.
-  bool prepare_update(MonOpRequestRef op);
+  void encode_pending(MonitorDBStore::TransactionRef t) override;
+  void encode_full(MonitorDBStore::TransactionRef t) override;
+  version_t get_trim_to() const override;
+  bool preprocess_query(MonOpRequestRef op) override;  // true if processed.
+  bool prepare_update(MonOpRequestRef op) override;
 
   bool preprocess_log(MonOpRequestRef op);
   bool prepare_log(MonOpRequestRef op);
   void _updated_log(MonOpRequestRef op);
 
-  bool should_propose(double& delay);
+  bool should_propose(double& delay) override;
 
-  bool should_stash_full() {
+  bool should_stash_full() override {
     // commit a LogSummary on every commit
     return true;
   }
@@ -156,20 +156,19 @@ private:
   bool preprocess_command(MonOpRequestRef op);
   bool prepare_command(MonOpRequestRef op);
 
-  bool _create_sub_summary(MLog *mlog, int level);
   void _create_sub_incremental(MLog *mlog, int level, version_t sv);
 
  public:
   LogMonitor(Monitor *mn, Paxos *p, const string& service_name) 
     : PaxosService(mn, p, service_name) { }
 
-  void init() {
+  void init() override {
     generic_dout(10) << "LogMonitor::init" << dendl;
-    g_conf->add_observer(this);
+    g_conf().add_observer(this);
     update_log_channels();
   }
   
-  void tick();  // check state, take actions
+  void tick() override;  // check state, take actions
 
   void check_subs();
   void check_sub(Subscription *s);
@@ -182,11 +181,11 @@ private:
    */
   int sub_name_to_id(const string& n);
 
-  void on_shutdown() {
-    g_conf->remove_observer(this);
+  void on_shutdown() override {
+    g_conf().remove_observer(this);
   }
 
-  const char **get_tracked_conf_keys() const {
+  const char **get_tracked_conf_keys() const override {
     static const char* KEYS[] = {
       "mon_cluster_log_to_syslog",
       "mon_cluster_log_to_syslog_level",
@@ -200,7 +199,7 @@ private:
     };
     return KEYS;
   }
-  void handle_conf_change(const struct md_config_t *conf,
-                          const std::set<std::string> &changed);
+  void handle_conf_change(const ConfigProxy& conf,
+                          const std::set<std::string> &changed) override;
 };
 #endif

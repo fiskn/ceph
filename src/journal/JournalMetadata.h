@@ -22,7 +22,7 @@
 #include <list>
 #include <map>
 #include <string>
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 class SafeTimer;
 
@@ -46,7 +46,7 @@ public:
   JournalMetadata(ContextWQ *work_queue, SafeTimer *timer, Mutex *timer_lock,
                   librados::IoCtx &ioctx, const std::string &oid,
                   const std::string &client_id, const Settings &settings);
-  ~JournalMetadata();
+  ~JournalMetadata() override;
 
   void init(Context *on_init);
   void shut_down(Context *on_finish);
@@ -158,6 +158,7 @@ public:
 private:
   typedef std::map<uint64_t, uint64_t> AllocatedEntryTids;
   typedef std::list<JournalMetadataListener*> Listeners;
+  typedef std::list<Context*> Contexts;
 
   struct CommitEntry {
     uint64_t object_num;
@@ -180,11 +181,11 @@ private:
     C_WatchCtx(JournalMetadata *_journal_metadata)
       : journal_metadata(_journal_metadata) {}
 
-    virtual void handle_notify(uint64_t notify_id, uint64_t cookie,
-                               uint64_t notifier_id, bufferlist& bl) {
+    void handle_notify(uint64_t notify_id, uint64_t cookie,
+                               uint64_t notifier_id, bufferlist& bl) override {
       journal_metadata->handle_watch_notify(notify_id, cookie);
     }
-    virtual void handle_error(uint64_t cookie, int err) {
+    void handle_error(uint64_t cookie, int err) override {
       journal_metadata->handle_watch_error(err);
     }
   };
@@ -196,10 +197,10 @@ private:
       : journal_metadata(_journal_metadata) {
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_WatchReset() {
+    ~C_WatchReset() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       journal_metadata->handle_watch_reset();
     }
   };
@@ -211,10 +212,10 @@ private:
       : journal_metadata(_journal_metadata) {
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_CommitPositionTask() {
+    ~C_CommitPositionTask() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       Mutex::Locker locker(journal_metadata->m_lock);
       journal_metadata->handle_commit_position_task();
     };
@@ -228,10 +229,10 @@ private:
       : journal_metadata(_journal_metadata), on_safe(_on_safe) {
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_AioNotify() {
+    ~C_AioNotify() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       journal_metadata->handle_notified(r);
       if (on_safe != nullptr) {
         on_safe->complete(0);
@@ -247,10 +248,10 @@ private:
       : journal_metadata(_journal_metadata), on_safe(_on_safe) {
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_NotifyUpdate() {
+    ~C_NotifyUpdate() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       if (r == 0) {
         journal_metadata->async_notify_update(on_safe);
         return;
@@ -270,10 +271,10 @@ private:
       Mutex::Locker locker(journal_metadata->m_lock);
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_ImmutableMetadata() {
+    ~C_ImmutableMetadata() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       journal_metadata->handle_immutable_metadata(r, on_finish);
     }
   };
@@ -283,18 +284,16 @@ private:
     uint64_t minimum_set;
     uint64_t active_set;
     RegisteredClients registered_clients;
-    Context *on_finish;
 
-    C_Refresh(JournalMetadata *_journal_metadata, Context *_on_finish)
-      : journal_metadata(_journal_metadata), minimum_set(0), active_set(0),
-        on_finish(_on_finish) {
+    C_Refresh(JournalMetadata *_journal_metadata)
+      : journal_metadata(_journal_metadata), minimum_set(0), active_set(0) {
       Mutex::Locker locker(journal_metadata->m_lock);
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_Refresh() {
+    ~C_Refresh() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       journal_metadata->handle_refresh_complete(this, r);
     }
   };
@@ -334,10 +333,17 @@ private:
   size_t m_update_notifications;
   Cond m_update_cond;
 
+  size_t m_ignore_watch_notifies = 0;
+  size_t m_refreshes_in_progress = 0;
+  Contexts m_refresh_ctxs;
+
   uint64_t m_commit_position_tid = 0;
   ObjectSetPosition m_commit_position;
   Context *m_commit_position_ctx;
   Context *m_commit_position_task_ctx;
+
+  size_t m_flush_commits_in_progress = 0;
+  Contexts m_flush_commit_position_ctxs;
 
   AsyncOpTracker m_async_op_tracker;
 
@@ -356,7 +362,7 @@ private:
   void handle_watch_error(int err);
   void handle_notified(int r);
 
-  Context *schedule_laggy_clients_disconnect(Context *on_finish);
+  void schedule_laggy_clients_disconnect(Context *on_finish);
 
   friend std::ostream &operator<<(std::ostream &os,
 				  const JournalMetadata &journal_metadata);

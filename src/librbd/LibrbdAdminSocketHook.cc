@@ -6,6 +6,7 @@
 #include "librbd/ImageCtx.h"
 #include "librbd/LibrbdAdminSocketHook.h"
 #include "librbd/internal.h"
+#include "librbd/io/ImageRequestWQ.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -23,8 +24,8 @@ class FlushCacheCommand : public LibrbdAdminSocketCommand {
 public:
   explicit FlushCacheCommand(ImageCtx *ictx) : ictx(ictx) {}
 
-  bool call(stringstream *ss) {
-    int r = flush(ictx);
+  bool call(stringstream *ss) override {
+    int r = ictx->io_work_queue->flush();
     if (r < 0) {
       *ss << "flush: " << cpp_strerror(r);
       return false;
@@ -40,7 +41,7 @@ struct InvalidateCacheCommand : public LibrbdAdminSocketCommand {
 public:
   explicit InvalidateCacheCommand(ImageCtx *ictx) : ictx(ictx) {}
 
-  bool call(stringstream *ss) {
+  bool call(stringstream *ss) override {
     int r = invalidate_cache(ictx);
     if (r < 0) {
       *ss << "invalidate_cache: " << cpp_strerror(r);
@@ -87,10 +88,12 @@ LibrbdAdminSocketHook::~LibrbdAdminSocketHook() {
   }
 }
 
-bool LibrbdAdminSocketHook::call(std::string command, cmdmap_t& cmdmap,
-				 std::string format, bufferlist& out) {
+bool LibrbdAdminSocketHook::call(std::string_view command,
+				 const cmdmap_t& cmdmap,
+				 std::string_view format,
+				 bufferlist& out) {
   Commands::const_iterator i = commands.find(command);
-  assert(i != commands.end());
+  ceph_assert(i != commands.end());
   stringstream ss;
   bool r = i->second->call(&ss);
   out.append(ss);

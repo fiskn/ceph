@@ -4,8 +4,10 @@ Workunit task -- Run ceph on sets of specific clients
 import logging
 import pipes
 import os
+import re
 
 from util import get_remote_for_role
+from util.workunit import get_refspec_after_overrides
 
 from teuthology import misc
 from teuthology.config import config as teuth_config
@@ -14,7 +16,6 @@ from teuthology.parallel import parallel
 from teuthology.orchestra import run
 
 log = logging.getLogger(__name__)
-
 
 def task(ctx, config):
     """
@@ -68,6 +69,17 @@ def task(ctx, config):
               backup.client.0: [foo]
               client.1: [bar] # cluster is implicitly 'ceph'
 
+    You can also specify an alternative top-level dir to 'qa/workunits', like
+    'qa/standalone', with::
+
+        tasks:
+        - install:
+        - workunit:
+            basedir: qa/standalone
+            clients:
+              client.0:
+                - test-ceph-helpers.sh
+
     :param ctx: Context
     :param config: Configuration
     """
@@ -76,17 +88,9 @@ def task(ctx, config):
         'configuration must contain a dictionary of clients'
 
     overrides = ctx.config.get('overrides', {})
-    misc.deep_merge(config, overrides.get('workunit', {}))
-
-    refspec = config.get('branch')
-    if refspec is None:
-        refspec = config.get('tag')
-    if refspec is None:
-        refspec = config.get('sha1')
-    if refspec is None:
-        refspec = 'HEAD'
-
+    refspec = get_refspec_after_overrides(config, overrides)
     timeout = config.get('timeout', '3h')
+    cleanup = config.get('cleanup', True)
 
     log.info('Pulling workunits from ref %s', refspec)
 
@@ -108,21 +112,28 @@ def task(ctx, config):
         created_mountpoint[role] = created_mnt_dir
 
     # Execute any non-all workunits
+    log.info("timeout={}".format(timeout))
+    log.info("cleanup={}".format(cleanup))
     with parallel() as p:
         for role, tests in clients.iteritems():
             if role != "all":
                 p.spawn(_run_tests, ctx, refspec, role, tests,
-                        config.get('env'), timeout=timeout)
+                        config.get('env'),
+                        basedir=config.get('basedir','qa/workunits'),
+                        timeout=timeout,cleanup=cleanup)
 
-    # Clean up dirs from any non-all workunits
-    for role, created in created_mountpoint.items():
-        _delete_dir(ctx, role, created)
+    if cleanup:
+        # Clean up dirs from any non-all workunits
+        for role, created in created_mountpoint.items():
+            _delete_dir(ctx, role, created)
 
     # Execute any 'all' workunits
     if 'all' in clients:
         all_tasks = clients["all"]
         _spawn_on_all_clients(ctx, refspec, all_tasks, config.get('env'),
-                              config.get('subdir'), timeout=timeout)
+                              config.get('basedir', 'qa/workunits'),
+                              config.get('subdir'), timeout=timeout,
+                              cleanup=cleanup)
 
 
 def _client_mountpoint(ctx, cluster, id_):
@@ -250,7 +261,7 @@ def _make_scratch_dir(ctx, role, subdir):
     return created_mountpoint
 
 
-def _spawn_on_all_clients(ctx, refspec, tests, env, subdir, timeout=None):
+def _spawn_on_all_clients(ctx, refspec, tests, env, basedir, subdir, timeout=None, cleanup=True):
     """
     Make a scratch directory for each client in the cluster, and then for each
     test spawn _run_tests() for each role.
@@ -269,14 +280,19 @@ def _spawn_on_all_clients(ctx, refspec, tests, env, subdir, timeout=None):
     for unit in tests:
         with parallel() as p:
             for role, remote in client_remotes.items():
-                p.spawn(_run_tests, ctx, refspec, role, [unit], env, subdir,
+                p.spawn(_run_tests, ctx, refspec, role, [unit], env,
+                        basedir,
+                        subdir,
                         timeout=timeout)
 
     # cleanup the generated client directories
-    for role, _ in client_remotes.items():
-        _delete_dir(ctx, role, created_mountpoint[role])
+    if cleanup:
+        for role, _ in client_remotes.items():
+            _delete_dir(ctx, role, created_mountpoint[role])
 
-def _run_tests(ctx, refspec, role, tests, env, subdir=None, timeout=None):
+
+def _run_tests(ctx, refspec, role, tests, env, basedir,
+               subdir=None, timeout=None, cleanup=True):
     """
     Run the individual test. Create a scratch directory and then extract the
     workunits from git. Make the executables, and then run the tests.
@@ -306,45 +322,30 @@ def _run_tests(ctx, refspec, role, tests, env, subdir=None, timeout=None):
     else:
         scratch_tmp = os.path.join(mnt, subdir)
     clonedir = '{tdir}/clone.{role}'.format(tdir=testdir, role=role)
-    srcdir = '{cdir}/qa/workunits'.format(cdir=clonedir)
+    srcdir = '{cdir}/{basedir}'.format(cdir=clonedir,
+                                       basedir=basedir)
 
-    git_url = teuth_config.get_ceph_git_url()
+    git_url = teuth_config.get_ceph_qa_suite_git_url()
+    # if we are running an upgrade test, and ceph-ci does not have branches like
+    # `jewel`, so should use ceph.git as an alternative.
     try:
-        remote.run(
-            logger=log.getChild(role),
-            args=[
-                'git',
-                'clone',
-                git_url,
-                clonedir,
-                run.Raw(';'),
-                'cd', '--', clonedir,
-                run.Raw('&&'),
-                'git', 'checkout', refspec,
-            ],
-        )
+        remote.run(logger=log.getChild(role),
+                   args=refspec.clone(git_url, clonedir))
     except CommandFailedError:
-        alt_git_url = git_url.replace('ceph-ci', 'ceph')
+        if git_url.endswith('/ceph-ci.git'):
+            alt_git_url = git_url.replace('/ceph-ci.git', '/ceph.git')
+        elif git_url.endswith('/ceph-ci'):
+            alt_git_url = re.sub(r'/ceph-ci$', '/ceph.git', git_url)
+        else:
+            raise
         log.info(
             "failed to check out '%s' from %s; will also try in %s",
             refspec,
             git_url,
             alt_git_url,
         )
-        remote.run(
-            logger=log.getChild(role),
-            args=[
-                'git',
-                'clone',
-                alt_git_url,
-                clonedir,
-                run.Raw(';'),
-                'cd', '--', clonedir,
-                run.Raw('&&'),
-                'git', 'checkout', refspec,
-            ],
-        )
-
+        remote.run(logger=log.getChild(role),
+                   args=refspec.clone(alt_git_url, clonedir))
     remote.run(
         logger=log.getChild(role),
         args=[
@@ -383,6 +384,7 @@ def _run_tests(ctx, refspec, role, tests, env, subdir=None, timeout=None):
                     run.Raw('CEPH_ID="{id}"'.format(id=id_)),
                     run.Raw('PATH=$PATH:/usr/sbin'),
                     run.Raw('CEPH_BASE={dir}'.format(dir=clonedir)),
+                    run.Raw('CEPH_ROOT={dir}'.format(dir=clonedir)),
                 ]
                 if env is not None:
                     for var, val in env.iteritems():
@@ -406,15 +408,14 @@ def _run_tests(ctx, refspec, role, tests, env, subdir=None, timeout=None):
                     args=args,
                     label="workunit test {workunit}".format(workunit=workunit)
                 )
-                remote.run(
-                    logger=log.getChild(role),
-                    args=['sudo', 'rm', '-rf', '--', scratch_tmp],
-                )
+                if cleanup:
+                    args=['sudo', 'rm', '-rf', '--', scratch_tmp]
+                    remote.run(logger=log.getChild(role), args=args, timeout=(15*60))
     finally:
         log.info('Stopping %s on %s...', tests, role)
+        args=['sudo', 'rm', '-rf', '--', workunits_file, clonedir]
+        # N.B. don't cleanup scratch_tmp! If the mount is broken then rm will hang.
         remote.run(
             logger=log.getChild(role),
-            args=[
-                'rm', '-rf', '--', workunits_file, clonedir,
-            ],
+            args=args,
         )

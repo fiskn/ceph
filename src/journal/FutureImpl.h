@@ -12,7 +12,7 @@
 #include <map>
 #include <boost/noncopyable.hpp>
 #include <boost/intrusive_ptr.hpp>
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 class Context;
 
@@ -57,7 +57,7 @@ public:
   }
   inline void set_flush_in_progress() {
     Mutex::Locker locker(m_lock);
-    assert(m_flush_handler);
+    ceph_assert(m_flush_handler);
     m_flush_handler.reset();
     m_flush_state = FLUSH_STATE_IN_PROGRESS;
   }
@@ -89,11 +89,11 @@ private:
   struct C_ConsistentAck : public Context {
     FutureImplPtr future;
     C_ConsistentAck(FutureImpl *_future) : future(_future) {}
-    virtual void complete(int r) {
+    void complete(int r) override {
       future->consistent(r);
       future.reset();
     }
-    virtual void finish(int r) {}
+    void finish(int r) override {}
   };
 
   uint64_t m_tag_tid;
@@ -113,6 +113,7 @@ private:
   Contexts m_contexts;
 
   FutureImplPtr prepare_flush(FlushHandlers *flush_handlers);
+  FutureImplPtr prepare_flush(FlushHandlers *flush_handlers, Mutex &lock);
 
   void consistent(int r);
   void finish_unlock();

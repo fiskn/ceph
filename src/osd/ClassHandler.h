@@ -1,3 +1,5 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// vim: ts=8 sw=2 smarttab
 #ifndef CEPH_CLASSHANDLER_H
 #define CEPH_CLASSHANDLER_H
 
@@ -34,7 +36,7 @@ public:
   };
 
   struct ClassFilter {
-    struct ClassHandler::ClassData *cls;
+    struct ClassHandler::ClassData *cls = nullptr;
     std::string name;
     cls_cxx_filter_factory_t fn;
 
@@ -57,7 +59,7 @@ public:
     ClassHandler *handler;
     void *handle;
 
-    bool whitelisted;
+    bool whitelisted = false;
 
     map<string, ClassMethod> methods_map;
     map<string, ClassFilter> filters_map;

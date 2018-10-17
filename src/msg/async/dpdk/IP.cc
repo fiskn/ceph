@@ -38,17 +38,16 @@
 
 #include "capture.h"
 #include "IP.h"
-#include "shared_ptr.h"
 #include "toeplitz.h"
 
 #include "common/dout.h"
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 #define dout_subsys ceph_subsys_dpdk
 #undef dout_prefix
 #define dout_prefix *_dout << "dpdk "
 
-std::ostream& operator<<(std::ostream& os, ipv4_address a) {
+std::ostream& operator<<(std::ostream& os, const ipv4_address& a) {
   auto ip = a.ip;
   return os << ((ip >> 24) & 0xff) << "." << ((ip >> 16) & 0xff)
             << "." << ((ip >> 8) & 0xff) << "." << ((ip >> 0) & 0xff);
@@ -63,7 +62,7 @@ class C_handle_frag_timeout : public EventCallback {
 
  public:
   C_handle_frag_timeout(ipv4 *i): _ipv4(i) {}
-  void do_request(int fd_or_id) {
+  void do_request(uint64_t fd_or_id) {
     _ipv4->frag_timeout();
   }
 };
@@ -191,7 +190,7 @@ int ipv4::handle_received_packet(Packet p, ethernet_address from)
     // This is a newly created frag_id
     if (frag.mem_size == 0) {
       _frags_age.push_back(frag_id);
-      frag.rx_time = ceph_clock_now(cct);
+      frag.rx_time = ceph_clock_now();
     }
     auto added_size = frag.merge(h, offset, std::move(p));
     _frag_mem += added_size;
@@ -374,7 +373,7 @@ void ipv4::frag_timeout() {
   if (_frags.empty()) {
     return;
   }
-  auto now = ceph_clock_now(cct);
+  auto now = ceph_clock_now();
   for (auto it = _frags_age.begin(); it != _frags_age.end();) {
     auto frag_id = *it;
     auto& frag = _frags[frag_id];

@@ -27,11 +27,11 @@ public:
   explicit CompressionPluginSnappy(CephContext* cct) : CompressionPlugin(cct)
   {}
 
-  virtual int factory(CompressorRef *cs,
-                      std::ostream *ss)
+  int factory(CompressorRef *cs,
+                      std::ostream *ss) override
   {
     if (compressor == 0) {
-      SnappyCompressor *interface = new SnappyCompressor();
+      SnappyCompressor *interface = new SnappyCompressor(cct);
       compressor = CompressorRef(interface);
     }
     *cs = compressor;

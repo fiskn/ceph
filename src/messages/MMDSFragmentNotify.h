@@ -17,44 +17,48 @@
 
 #include "msg/Message.h"
 
-class MMDSFragmentNotify : public Message {
+class MMDSFragmentNotify : public MessageInstance<MMDSFragmentNotify> {
+public:
+  friend factory;
+private:
   inodeno_t ino;
   frag_t basefrag;
-  int8_t bits;
+  int8_t bits = 0;
 
  public:
-  inodeno_t get_ino() { return ino; }
-  frag_t get_basefrag() { return basefrag; }
-  int get_bits() { return bits; }
+  inodeno_t get_ino() const { return ino; }
+  frag_t get_basefrag() const { return basefrag; }
+  int get_bits() const { return bits; }
 
   bufferlist basebl;
 
-  MMDSFragmentNotify() : Message(MSG_MDS_FRAGMENTNOTIFY) {}
+protected:
+  MMDSFragmentNotify() : MessageInstance(MSG_MDS_FRAGMENTNOTIFY) {}
   MMDSFragmentNotify(dirfrag_t df, int b) :
-	Message(MSG_MDS_FRAGMENTNOTIFY),
+ MessageInstance(MSG_MDS_FRAGMENTNOTIFY),
     ino(df.ino), basefrag(df.frag), bits(b) { }
-private:
-  ~MMDSFragmentNotify() {}
+  ~MMDSFragmentNotify() override {}
 
 public:  
-  const char *get_type_name() const { return "fragment_notify"; }
-  void print(ostream& o) const {
+  const char *get_type_name() const override { return "fragment_notify"; }
+  void print(ostream& o) const override {
     o << "fragment_notify(" << ino << "." << basefrag
       << " " << (int)bits << ")";
   }
 
-  void encode_payload(uint64_t features) {
-    ::encode(ino, payload);
-    ::encode(basefrag, payload);
-    ::encode(bits, payload);
-    ::encode(basebl, payload);
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
+    encode(ino, payload);
+    encode(basefrag, payload);
+    encode(bits, payload);
+    encode(basebl, payload);
   }
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
-    ::decode(ino, p);
-    ::decode(basefrag, p);
-    ::decode(bits, p);
-    ::decode(basebl, p);
+  void decode_payload() override {
+    auto p = payload.cbegin();
+    decode(ino, p);
+    decode(basefrag, p);
+    decode(bits, p);
+    decode(basebl, p);
   }
   
 };

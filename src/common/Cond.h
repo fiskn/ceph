@@ -16,15 +16,8 @@
 #ifndef CEPH_COND_H
 #define CEPH_COND_H
 
-#include <time.h>
-#include <pthread.h>
-
-#include "include/Context.h"
-
-#include "common/ceph_time.h"
-#include "common/Mutex.h"
 #include "common/Clock.h"
-
+#include "include/Context.h"
 
 class Cond {
   // my bits
@@ -39,7 +32,7 @@ class Cond {
  public:
   Cond() : waiter_mutex(NULL) {
     int r = pthread_cond_init(&_c,NULL);
-    assert(r == 0);
+    ceph_assert(r == 0);
   }
   virtual ~Cond() { 
     pthread_cond_destroy(&_c); 
@@ -47,10 +40,10 @@ class Cond {
 
   int Wait(Mutex &mutex)  { 
     // make sure this cond is used with one mutex only
-    assert(waiter_mutex == NULL || waiter_mutex == &mutex);
+    ceph_assert(waiter_mutex == NULL || waiter_mutex == &mutex);
     waiter_mutex = &mutex;
 
-    assert(mutex.is_locked());
+    ceph_assert(mutex.is_locked());
 
     mutex._pre_unlock();
     int r = pthread_cond_wait(&_c, &mutex._m);
@@ -60,10 +53,10 @@ class Cond {
 
   int WaitUntil(Mutex &mutex, utime_t when) {
     // make sure this cond is used with one mutex only
-    assert(waiter_mutex == NULL || waiter_mutex == &mutex);
+    ceph_assert(waiter_mutex == NULL || waiter_mutex == &mutex);
     waiter_mutex = &mutex;
 
-    assert(mutex.is_locked());
+    ceph_assert(mutex.is_locked());
 
     struct timespec ts;
     when.to_timespec(&ts);
@@ -75,15 +68,15 @@ class Cond {
     return r;
   }
 
-  int WaitInterval(CephContext *cct, Mutex &mutex, utime_t interval) {
-    utime_t when = ceph_clock_now(cct);
+  int WaitInterval(Mutex &mutex, utime_t interval) {
+    utime_t when = ceph_clock_now();
     when += interval;
     return WaitUntil(mutex, when);
   }
 
   template<typename Duration>
-  int WaitInterval(CephContext *cct, Mutex &mutex, Duration interval) {
-    ceph::real_time when(ceph::real_clock::now(cct));
+  int WaitInterval(Mutex &mutex, Duration interval) {
+    ceph::real_time when(ceph::real_clock::now());
     when += interval;
 
     struct timespec ts = ceph::real_clock::to_timespec(when);
@@ -101,7 +94,7 @@ class Cond {
   }
   int Signal() { 
     // make sure signaler is holding the waiter's lock.
-    assert(waiter_mutex == NULL ||
+    ceph_assert(waiter_mutex == NULL ||
 	   waiter_mutex->is_locked());
 
     int r = pthread_cond_broadcast(&_c);
@@ -109,7 +102,7 @@ class Cond {
   }
   int SignalOne() { 
     // make sure signaler is holding the waiter's lock.
-    assert(waiter_mutex == NULL ||
+    ceph_assert(waiter_mutex == NULL ||
 	   waiter_mutex->is_locked());
 
     int r = pthread_cond_signal(&_c);
@@ -117,7 +110,7 @@ class Cond {
   }
   int SignalAll() { 
     // make sure signaler is holding the waiter's lock.
-    assert(waiter_mutex == NULL ||
+    ceph_assert(waiter_mutex == NULL ||
 	   waiter_mutex->is_locked());
 
     int r = pthread_cond_broadcast(&_c);
@@ -139,7 +132,7 @@ public:
   C_Cond(Cond *c, bool *d, int *r) : cond(c), done(d), rval(r) {
     *done = false;
   }
-  void finish(int r) {
+  void finish(int r) override {
     *done = true;
     *rval = r;
     cond->Signal();
@@ -162,13 +155,13 @@ public:
   C_SafeCond(Mutex *l, Cond *c, bool *d, int *r=0) : lock(l), cond(c), done(d), rval(r) {
     *done = false;
   }
-  void finish(int r) {
-    lock->Lock();
+  void finish(int r) override {
+    lock->lock();
     if (rval)
       *rval = r;
     *done = true;
     cond->Signal();
-    lock->Unlock();
+    lock->unlock();
   }
 };
 
@@ -185,11 +178,12 @@ class C_SaferCond : public Context {
   int rval;      ///< return value
 public:
   C_SaferCond() : lock("C_SaferCond"), done(false), rval(0) {}
-  void finish(int r) { complete(r); }
+  explicit C_SaferCond(const std::string &name) : lock(name), done(false), rval(0) {}
+  void finish(int r) override { complete(r); }
 
   /// We overload complete in order to not delete the context
-  void complete(int r) {
-    Mutex::Locker l(lock);
+  void complete(int r) override {
+    std::lock_guard<Mutex> l(lock);
     done = true;
     rval = r;
     cond.Signal();
@@ -197,10 +191,22 @@ public:
 
   /// Returns rval once the Context is called
   int wait() {
-    Mutex::Locker l(lock);
+    std::lock_guard<Mutex> l(lock);
     while (!done)
       cond.Wait(lock);
     return rval;
+  }
+
+  /// Wait until the \c secs expires or \c complete() is called
+  int wait_for(double secs) {
+    utime_t interval;
+    interval.set_from_double(secs);
+    std::lock_guard<Mutex> l{lock};
+    if (done) {
+      return rval;
+    }
+    cond.WaitInterval(lock, interval);
+    return done ? rval : ETIMEDOUT;
   }
 };
 

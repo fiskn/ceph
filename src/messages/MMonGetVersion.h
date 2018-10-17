@@ -25,34 +25,37 @@
  * can be used to determine whether a pool actually does not exist, or
  * if it may have been created but the map was not received yet.
  */
-class MMonGetVersion : public Message {
+class MMonGetVersion : public MessageInstance<MMonGetVersion> {
 public:
-  MMonGetVersion() : Message(CEPH_MSG_MON_GET_VERSION) {}
+  friend factory;
 
-  const char *get_type_name() const {
+  MMonGetVersion() : MessageInstance(CEPH_MSG_MON_GET_VERSION) {}
+
+  const char *get_type_name() const override {
     return "mon_get_version";
   }
 
-  void print(ostream& o) const {
+  void print(ostream& o) const override {
     o << "mon_get_version(what=" << what << " handle=" << handle << ")";
   }
 
-  void encode_payload(uint64_t features) {
-    ::encode(handle, payload);
-    ::encode(what, payload);
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
+    encode(handle, payload);
+    encode(what, payload);
   }
 
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
-    ::decode(handle, p);
-    ::decode(what, p);
+  void decode_payload() override {
+    auto p = payload.cbegin();
+    decode(handle, p);
+    decode(what, p);
   }
 
-  ceph_tid_t handle;
+  ceph_tid_t handle = 0;
   string what;
 
 private:
-  ~MMonGetVersion() {}
+  ~MMonGetVersion() override {}
 };
 
 #endif

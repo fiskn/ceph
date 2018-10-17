@@ -4,195 +4,217 @@
 
 ``client acl type``
 
-:Description: Set to ``"posix_acl"`` to enable POSIX ACLs.
+:Description: Set the ACL type. Currently, only possible value is ``"posix_acl"`` to enable POSIX ACL, or an empty string. This option only takes effect when the ``fuse_default_permissions`` is set to ``false``.
+
 :Type: String
-:Default: ``""`` (N/A)
+:Default: ``""`` (no ACL enforcement)
 
 ``client cache mid``
 
-:Description: Set client cache mid-point.
+:Description: Set client cache midpoint. The midpoint splits the least recently used lists into a hot and warm list.
 :Type: Float
 :Default: ``0.75``
 
-``client_cache_size``
+``client cache size``
 
-:Description: Set client cache object count maximum.
+:Description: Set the number of inodes that the client keeps in the metadata cache.
 :Type: Integer
 :Default: ``16384``
 
-``client_caps_release_delay``
+``client caps release delay``
 
-:Description: Delay between capability releases.
+:Description: Set the delay between capability releases in seconds. The delay sets how many seconds a client waits to release capabilities that it no longer needs in case the capabilities are needed for another user space operation.
 :Type: Integer
 :Default: ``5`` (seconds)
 
-``client_debug_force_sync_read``
+``client debug force sync read``
 
-:Description: Always read synchronously (go to osds).
+:Description: If set to ``true``, clients read data directly from OSDs instead of using a local page cache.
 :Type: Boolean
 :Default: ``false``
 
-``client_debug_getattr_caps``
+``client dirsize rbytes``
 
-:Description: Check if MDS reply contains wanted caps.
-:Type: Boolean
-:Default: ``false``
-
-``client_dirsize_rbytes``
-
-:Description: Use recursive size of directory for directory ``st_size`` stat member.
+:Description: If set to ``true``, use the recursive size of a directory (that is, total of all descendants).
 :Type: Boolean
 :Default: ``true``
 
-``client_max_inline_size``
+``client max inline size``
 
-:Description: Maximum size of inlined data stored in a file inode (rather than in a separate data object in RADOS). This setting only applies if the ``inline_data`` flag is set on the MDSMap.
+:Description: Set the maximum size of inlined data stored in a file inode rather than in a separate data object in RADOS. This setting only applies if the ``inline_data`` flag is set on the MDS map.
 :Type: Integer
 :Default: ``4096``
 
-``client_metadata``
+``client metadata``
 
-:Description: Comma-delimited strings for client metadata sent to each MDS.
+:Description: Comma-delimited strings for client metadata sent to each MDS, in addition to the automatically generated version, host name, and other metadata.
 :Type: String
-:Default: ``""`` (N/A)
+:Default: ``""`` (no additional metadata)
 
-``client_mount_gid``
+``client mount gid``
 
-:Description: Group-id of CephFS mount.
+:Description: Set the group ID of CephFS mount.
 :Type: Integer
 :Default: ``-1``
 
-``client_mount_timeout``
+``client mount timeout``
 
-:Description: Timeout for CephFS mount.
+:Description: Set the timeout for CephFS mount in seconds.
 :Type: Float
-:Default: ``300.0`` (seconds)
+:Default: ``300.0``
 
-``client_mount_uid``
+``client mount uid``
 
-:Description: User-id of CephFS mount.
+:Description: Set the user ID of CephFS mount.
 :Type: Integer
 :Default: ``-1``
 
-``client_mountpoint``
+``client mountpoint``
 
-:Description: Directory to mount on the CephFS file system.
+:Description: Directory to mount on the CephFS file system. An alternative to the ``-r`` option of the ``ceph-fuse`` command.
 :Type: String
 :Default: ``"/"``
 
-``client_oc``
+``client oc``
 
-:Description: Enable object caching. **Setting currently ignored.**
+:Description: Enable object caching.
 :Type: Boolean
 :Default: ``true``
 
-``client_oc_max_dirty``
+``client oc max dirty``
 
-:Description: Maximum number of dirty bytes in object cache.
+:Description: Set the maximum number of dirty bytes in the object cache.
 :Type: Integer
 :Default: ``104857600`` (100MB)
 
-``client_oc_max_dirty_age``
+``client oc max dirty age``
 
-:Description: Maximum age of dirty data in the object cache before writeback.
+:Description: Set the maximum age in seconds of dirty data in the object cache before writeback.
 :Type: Float
 :Default: ``5.0`` (seconds)
 
-``client_oc_max_objects``
+``client oc max objects``
 
-:Description: Maximum number of objects in the object cache.
+:Description: Set the maximum number of objects in the object cache.
 :Type: Integer
 :Default: ``1000``
 
-``client_oc_size``
+``client oc size``
 
-:Description: Maximum size of cached data in the object cache.
+:Description: Set how many bytes of data will the client cache.
 :Type: Integer
-:Default: ``209715200`` (200MB)
+:Default: ``209715200`` (200 MB)
 
-``client_oc_target_dirty``
+``client oc target dirty``
 
-:Description: Target size of dirty data. It is recommended to keep this low.
+:Description: Set the target size of dirty data. We recommend to keep this number low.
 :Type: Integer
 :Default: ``8388608`` (8MB)
 
-``client_permissions``
+``client permissions``
 
 :Description: Check client permissions on all I/O operations.
 :Type: Boolean
 :Default: ``true``
 
-``client_quota``
+``client quota``
 
-:Description: Enable client quota checking.
+:Description: Enable client quota checking if set to ``true``.
 :Type: Boolean
 :Default: ``true``
 
-``client_quota_df``
+``client quota df``
 
-:Description: Report root directory quota for statfs operation.
+:Description: Report root directory quota for the ``statfs`` operation.
 :Type: Boolean
 :Default: ``true``
 
-``client_readahead_max_bytes``
+``client readahead max bytes``
 
-:Description: Maximum bytes of readahead used for future read operations. Overridden by ``client_readahead_max_periods``.
+:Description: Set the maximum number of bytes that the client reads ahead for future read operations. Overridden by the ``client_readahead_max_periods`` setting.
 :Type: Integer
 :Default: ``0`` (unlimited)
 
-``client_readahead_max_periods``
+``client readahead max periods``
 
-:Description: Number of file layout periods (object size * number of stripes) to readahead. Overrides ``client_readahead_max_bytes``.
+:Description: Set the number of file layout periods (object size * number of stripes) that the client reads ahead. Overrides the ``client_readahead_max_bytes`` setting.
 :Type: Integer
 :Default: ``4``
 
-``client_readahead_min``
+``client readahead min``
 
-:Description: Minimum bytes to readahead.
+:Description: Set the minimum number bytes that the client reads ahead.
 :Type: Integer
 :Default: ``131072`` (128KB)
 
-``client_snapdir``
+``client reconnect stale``
 
-:Description: Name for the snapshot directory.
+:Description: Automatically reconnect stale session.
+:Type: Boolean
+:Default: ``false``
+
+``client snapdir``
+
+:Description: Set the snapshot directory name.
 :Type: String
 :Default: ``".snap"``
 
-``client_tick_interval``
+``client tick interval``
 
-:Description: Interval between capability renewal and other upkeep.
+:Description: Set the interval in seconds between capability renewal and other upkeep.
 :Type: Float
 :Default: ``1.0`` (seconds)
 
-``client_trace``
-
-:Description: Trace file path for all file operations. The output is designed to be used by the Ceph `synthetic client <../man/8/ceph-syn>`.
-:Type: String
-:Default: ``""`` (disabled)
-
-``client_use_random_mds``
+``client use random mds``
 
 :Description: Choose random MDS for each request.
 :Type: Boolean
 :Default: ``false``
 
+``fuse default permissions``
+
+:Description: When set to ``false``, ``ceph-fuse`` utility checks does its own permissions checking, instead of relying on the permissions enforcement in FUSE. Set to ``false`` together with the ``client acl type=posix_acl`` option to enable POSIX ACL.
+:Type: Boolean
+:Default: ``true``
+
+``fuse max write``
+
+:Description: Set the maximum number of bytes in a single write operation.  Because the FUSE default is 128kbytes, SO fuse_max_write default set to 0(The default does not take effect)
+:Type: Integer
+:Default: ``0``
+
 Developer Options
 #################
 
-``client_inject_fixed_oldest_tid``
+.. important:: These options are internal. They are listed here only to complete the list of options.
 
-:Description:
+``client debug getattr caps``
+
+:Description: Check if the reply from the MDS contains required capabilities.
 :Type: Boolean
 :Default: ``false``
 
-``client_inject_release_failure``
-
-:Description:
-:Type: Boolean
-:Default: ``false``
-
-``client_debug_inject_tick_delay``
+``client debug inject tick delay``
 
 :Description: Add artificial delay between client ticks.
 :Type: Integer
 :Default: ``0``
+
+``client inject fixed oldest tid``
+
+:Description:
+:Type: Boolean
+:Default: ``false``
+
+``client inject release failure``
+
+:Description:
+:Type: Boolean
+:Default: ``false``
+
+``client trace``
+
+:Description: The path to the trace file for all file operations. The output is designed to be used by the Ceph `synthetic client <../../man/8/ceph-syn>`_.
+:Type: String
+:Default: ``""`` (disabled)
+

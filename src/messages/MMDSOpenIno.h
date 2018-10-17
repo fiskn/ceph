@@ -17,29 +17,38 @@
 
 #include "msg/Message.h"
 
-struct MMDSOpenIno : public Message {
+class MMDSOpenIno : public MessageInstance<MMDSOpenIno> {
+public:
+  friend factory;
+
   inodeno_t ino;
   vector<inode_backpointer_t> ancestors;
 
-  MMDSOpenIno() : Message(MSG_MDS_OPENINO) {}
-  MMDSOpenIno(ceph_tid_t t, inodeno_t i, vector<inode_backpointer_t>& a) :
-    Message(MSG_MDS_OPENINO), ino(i), ancestors(a) {
+protected:
+  MMDSOpenIno() : MessageInstance(MSG_MDS_OPENINO) {}
+  MMDSOpenIno(ceph_tid_t t, inodeno_t i, vector<inode_backpointer_t>* pa) :
+    MessageInstance(MSG_MDS_OPENINO), ino(i) {
     header.tid = t;
+    if (pa)
+      ancestors = *pa;
   }
+  ~MMDSOpenIno() override {}
 
-  const char *get_type_name() const { return "openino"; }
-  void print(ostream &out) const {
+public:
+  const char *get_type_name() const override { return "openino"; }
+  void print(ostream &out) const override {
     out << "openino(" << header.tid << " " << ino << " " << ancestors << ")";
   }
 
-  void encode_payload(uint64_t features) {
-    ::encode(ino, payload);
-    ::encode(ancestors, payload);
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
+    encode(ino, payload);
+    encode(ancestors, payload);
   }
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
-    ::decode(ino, p);
-    ::decode(ancestors, p);
+  void decode_payload() override {
+    auto p = payload.cbegin();
+    decode(ino, p);
+    decode(ancestors, p);
   }
 };
 

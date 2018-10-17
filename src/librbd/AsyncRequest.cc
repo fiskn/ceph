@@ -12,7 +12,7 @@ template <typename T>
 AsyncRequest<T>::AsyncRequest(T &image_ctx, Context *on_finish)
   : m_image_ctx(image_ctx), m_on_finish(on_finish), m_canceled(false),
     m_xlist_item(this) {
-  assert(m_on_finish != NULL);
+  ceph_assert(m_on_finish != NULL);
   start_request();
 }
 
@@ -27,7 +27,7 @@ void AsyncRequest<T>::async_complete(int r) {
 
 template <typename T>
 librados::AioCompletion *AsyncRequest<T>::create_callback_completion() {
-  return util::create_rados_safe_callback(this);
+  return util::create_rados_callback(this);
 }
 
 template <typename T>
@@ -52,7 +52,7 @@ void AsyncRequest<T>::finish_request() {
   decltype(m_image_ctx.async_requests_waiters) waiters;
   {
     Mutex::Locker async_ops_locker(m_image_ctx.async_ops_lock);
-    assert(m_xlist_item.remove_myself());
+    ceph_assert(m_xlist_item.remove_myself());
 
     if (m_image_ctx.async_requests.empty()) {
       waiters = std::move(m_image_ctx.async_requests_waiters);
@@ -66,4 +66,6 @@ void AsyncRequest<T>::finish_request() {
 
 } // namespace librbd
 
+#ifndef TEST_F
 template class librbd::AsyncRequest<librbd::ImageCtx>;
+#endif

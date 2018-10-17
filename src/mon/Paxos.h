@@ -162,7 +162,7 @@ enum {
 
 // i am one state machine.
 /**
- * This libary is based on the Paxos algorithm, but varies in a few key ways:
+ * This library is based on the Paxos algorithm, but varies in a few key ways:
  *  1- Only a single new value is generated at a time, simplifying the recovery logic.
  *  2- Nodes track "committed" values, and share them generously (and trustingly)
  *  3- A 'leasing' mechanism is built-in, allowing nodes to determine when it is 
@@ -230,6 +230,8 @@ public:
     STATE_WRITING_PREVIOUS,
     // leader: refresh following a commit
     STATE_REFRESH,
+    // Shutdown after WRITING or WRITING_PREVIOUS
+    STATE_SHUTDOWN
   };
 
   /**
@@ -257,6 +259,8 @@ public:
       return "writing-previous";
     case STATE_REFRESH:
       return "refresh";
+    case STATE_SHUTDOWN:
+      return "shutdown";
     default:
       return "UNKNOWN";
     }
@@ -270,6 +274,9 @@ private:
   /**
    * @}
    */
+  int commits_started = 0;
+
+  Cond shutdown_cond;
 
 public:
   /**
@@ -305,6 +312,9 @@ public:
 
   /// @return 'true' if we are refreshing an update just committed
   bool is_refresh() const { return state == STATE_REFRESH; }
+
+  /// @return 'true' if we are in the process of shutting down
+  bool is_shutdown() const { return state == STATE_SHUTDOWN; }
 
 private:
   /**
@@ -350,7 +360,7 @@ private:
    *
    * On the Leader, it will be the Proposal Number picked by the Leader 
    * itself. On the Peon, however, it will be the proposal sent by the Leader
-   * and it will only be updated iif its value is higher than the one
+   * and it will only be updated if its value is higher than the one
    * already known by the Peon.
    */
   version_t accepted_pn;
@@ -562,15 +572,6 @@ private:
    *	      not on the active state, or if the lease has expired.
    */
   list<Context*> waiting_for_writeable;
-  /**
-   * List of callbacks waiting for a commit to finish.
-   *
-   * @remarks This may be used to a) wait for an on-going commit to finish
-   *	      before we proceed with, say, a new proposal; or b) wait for the
-   *	      next commit to be finished so we are sure that our value was
-   *	      fully committed.
-   */
-  list<Context*> waiting_for_commit;
 
   /**
    * Pending proposal transaction
@@ -615,6 +616,11 @@ private:
   bool trimming;
 
   /**
+   * true if we want trigger_propose to *not* propose (yet)
+   */
+  bool plugged = false;
+
+  /**
    * @defgroup Paxos_h_callbacks Callback classes.
    * @{
    */
@@ -657,11 +663,11 @@ public:
     C_Proposal(Context *c, bufferlist& proposal_bl) :
 	proposer_context(c),
 	bl(proposal_bl),
-        proposed(false),
-	proposal_time(ceph_clock_now(NULL))
+	proposed(false),
+	proposal_time(ceph_clock_now())
       { }
 
-    void finish(int r) {
+    void finish(int r) override {
       if (proposer_context) {
 	proposer_context->complete(r);
 	proposer_context = NULL;
@@ -707,7 +713,7 @@ private:
    * Once a Peon receives a collect message from the Leader it will reply
    * with its first and last committed versions, as well as information so
    * the Leader may know if its Proposal Number was, or was not, accepted by
-   * the Peon. The Peon will accept the Leader's Proposal Number iif it is
+   * the Peon. The Peon will accept the Leader's Proposal Number if it is
    * higher than the Peon's currently accepted Proposal Number. The Peon may
    * also inform the Leader of accepted but uncommitted values.
    *
@@ -783,9 +789,9 @@ private:
    *
    * @pre We are the Leader
    * @pre We are on STATE_ACTIVE
-   * @post We commit, iif we are alone, or we send a message to each quorum 
+   * @post We commit, if we are alone, or we send a message to each quorum 
    *	   member
-   * @post We are on STATE_ACTIVE, iif we are alone, or on 
+   * @post We are on STATE_ACTIVE, if we are alone, or on 
    *	   STATE_UPDATING otherwise
    *
    * @param value The value being proposed to the quorum
@@ -800,8 +806,8 @@ private:
    *
    * @pre We are a Peon
    * @pre We are on STATE_ACTIVE
-   * @post We are on STATE_UPDATING iif we accept the Leader's proposal
-   * @post We send a reply message to the Leader iif we accept its proposal
+   * @post We are on STATE_UPDATING if we accept the Leader's proposal
+   * @post We send a reply message to the Leader if we accept its proposal
    *
    * @invariant The received message is an operation of type OP_BEGIN
    *
@@ -823,11 +829,11 @@ private:
    *
    * @pre We are the Leader
    * @pre We are on STATE_UPDATING
-   * @post We are on STATE_ACTIVE iif we received accepts from the full quorum
-   * @post We extended the lease iif we moved on to STATE_ACTIVE
-   * @post We are on STATE_UPDATING iif we didn't received accepts from the
+   * @post We are on STATE_ACTIVE if we received accepts from the full quorum
+   * @post We extended the lease if we moved on to STATE_ACTIVE
+   * @post We are on STATE_UPDATING if we didn't received accepts from the
    *	   full quorum
-   * @post We have committed iif we received accepts from a majority
+   * @post We have committed if we received accepts from a majority
    *
    * @invariant The received message is an operation of type OP_ACCEPT
    *
@@ -875,6 +881,7 @@ private:
    */
   void commit_start();
   void commit_finish();   ///< finish a commit after txn becomes durable
+  void abort_commit();    ///< Handle commit finish after shutdown started
   /**
    * Commit the new value to stable storage as being the latest available
    * version.
@@ -924,7 +931,7 @@ private:
    * @post A lease timeout callback is set
    * @post Move to STATE_ACTIVE
    * @post Fire up all the callbacks waiting for STATE_ACTIVE
-   * @post Fire up all the callbacks waiting for readable iif we are readable
+   * @post Fire up all the callbacks waiting for readable if we are readable
    * @post Ack the lease to the Leader
    *
    * @invariant The received message is an operation of type OP_LEASE
@@ -941,7 +948,7 @@ private:
    * fresh elections.
    *
    * @pre We are the Leader
-   * @post Cancel the Lease Ack timeout callback iif we receive acks from all
+   * @post Cancel the Lease Ack timeout callback if we receive acks from all
    *	   the quorum members
    *
    * @invariant The received message is an operation of type OP_LEASE_ACK
@@ -1141,8 +1148,8 @@ public:
    */
   static void decode_append_transaction(MonitorDBStore::TransactionRef t,
 					bufferlist& bl) {
-    MonitorDBStore::TransactionRef vt(new MonitorDBStore::Transaction);
-    bufferlist::iterator it = bl.begin();
+    auto vt(std::make_shared<MonitorDBStore::Transaction>());
+    auto it = bl.cbegin();
     vt->decode(it);
     t->append(vt);
   }
@@ -1187,14 +1194,26 @@ public:
    */
   bool should_trim() {
     int available_versions = get_version() - get_first_committed();
-    int maximum_versions = g_conf->paxos_min + g_conf->paxos_trim_min;
+    int maximum_versions = g_conf()->paxos_min + g_conf()->paxos_trim_min;
 
     if (trimming || (available_versions <= maximum_versions))
       return false;
 
     return true;
   }
- 
+
+  bool is_plugged() const {
+    return plugged;
+  }
+  void plug() {
+    ceph_assert(plugged == false);
+    plugged = true;
+  }
+  void unplug() {
+    ceph_assert(plugged == true);
+    plugged = false;
+  }
+
   // read
   /**
    * @defgroup Paxos_h_read_funcs Read-related functions
@@ -1247,7 +1266,7 @@ public:
    * @param onreadable A callback
    */
   void wait_for_readable(MonOpRequestRef op, Context *onreadable) {
-    assert(!is_readable());
+    ceph_assert(!is_readable());
     if (op)
       op->mark_event("paxos:wait_for_readable");
     waiting_for_readable.push_back(onreadable);
@@ -1289,7 +1308,7 @@ public:
    * @param c A callback
    */
   void wait_for_writeable(MonOpRequestRef op, Context *c) {
-    assert(!is_writeable());
+    ceph_assert(!is_writeable());
     if (op)
       op->mark_event("paxos:wait_for_writeable");
     waiting_for_writeable.push_back(c);
@@ -1323,25 +1342,6 @@ public:
    * something) that will be deferred (e.g., until the current round finishes).
    */
   bool trigger_propose();
-
-  /**
-   * Add oncommit to the back of the list of callbacks waiting for us to
-   * finish committing.
-   *
-   * @param oncommit A callback
-   */
-  void wait_for_commit(Context *oncommit) {
-    waiting_for_commit.push_back(oncommit);
-  }
-  /**
-   * Add oncommit to the front of the list of callbacks waiting for us to
-   * finish committing.
-   *
-   * @param oncommit A callback
-   */
-  void wait_for_commit_front(Context *oncommit) {
-    waiting_for_commit.push_front(oncommit);
-  }
   /**
    * @}
    */
@@ -1357,10 +1357,10 @@ inline ostream& operator<<(ostream& out, Paxos::C_Proposal& p)
 {
   string proposed = (p.proposed ? "proposed" : "unproposed");
   out << " " << proposed
-      << " queued " << (ceph_clock_now(NULL) - p.proposal_time)
+      << " queued " << (ceph_clock_now() - p.proposal_time)
       << " tx dump:\n";
-  MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
-  bufferlist::iterator p_it = p.bl.begin();
+  auto t(std::make_shared<MonitorDBStore::Transaction>());
+  auto p_it = p.bl.cbegin();
   t->decode(p_it);
   JSONFormatter f(true);
   t->dump(&f);

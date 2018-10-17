@@ -15,13 +15,14 @@ namespace librbd {
   class LibrbdAdminSocketHook : public AdminSocketHook {
   public:
     LibrbdAdminSocketHook(ImageCtx *ictx);
-    ~LibrbdAdminSocketHook();
+    ~LibrbdAdminSocketHook() override;
 
-    bool call(std::string command, cmdmap_t& cmdmap, std::string format,
-	      bufferlist& out);
+    bool call(std::string_view command, const cmdmap_t& cmdmap,
+	      std::string_view format, bufferlist& out) override;
 
   private:
-    typedef std::map<std::string,LibrbdAdminSocketCommand*> Commands;
+    typedef std::map<std::string,LibrbdAdminSocketCommand*,
+		     std::less<>> Commands;
 
     AdminSocket *admin_socket;
     Commands commands;

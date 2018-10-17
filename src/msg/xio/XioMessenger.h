@@ -17,23 +17,26 @@
 #define XIO_MESSENGER_H
 
 #include "msg/SimplePolicyMessenger.h"
+
+#include <atomic>
+
 extern "C" {
 #include "libxio.h"
 }
+
 #include "XioConnection.h"
 #include "XioPortal.h"
 #include "QueueStrategy.h"
-#include "include/atomic.h"
 #include "common/Thread.h"
 #include "common/Mutex.h"
-#include "include/Spinlock.h"
+#include "include/spinlock.h"
 
 class XioInit {
   /* safe to be called multiple times */
   void package_init(CephContext *cct);
 
 protected:
-  XioInit(CephContext *cct) {
+  explicit XioInit(CephContext *cct) {
     this->package_init(cct);
   }
 };
@@ -41,10 +44,10 @@ protected:
 class XioMessenger : public SimplePolicyMessenger, XioInit
 {
 private:
-  static atomic_t nInstances;
-  atomic_t nsessions;
-  atomic_t shutdown_called;
-  Spinlock conns_sp;
+  static std::atomic<uint64_t> nInstances = { 0 };
+  std::atomic<uint64_t> nsessions = { 0 };
+  std::atomic<bool> shutdown_called = { false };
+  ceph::spinlock conns_sp;
   XioConnection::ConnList conns_list;
   XioConnection::EntitySet conns_entity_map;
   XioPortals portals;
@@ -95,7 +98,9 @@ public:
 		    void *cb_user_context);
 
   /* Messenger interface */
-  virtual void set_addr_unknowns(const entity_addr_t &addr) override
+  virtual bool set_addr_unknowns(const entity_addrvec_t &addr) override
+    { } /* XXX applicable? */
+  virtual void set_addr(const entity_addr_t &addr) override
     { } /* XXX applicable? */
 
   virtual int get_dispatch_queue_len()
@@ -128,6 +133,13 @@ public:
     { return EINVAL; }
 
   virtual ConnectionRef get_connection(const entity_inst_t& dest);
+
+  // compat hack
+  ConnectionRef connect_to(
+    int type, const entity_addrvec_t& dest) override {
+    return get_connection(entity_inst_t(entity_name_t(type, -1),
+					dest.legacy_addr()));
+  }
 
   virtual ConnectionRef get_loopback_connection();
 

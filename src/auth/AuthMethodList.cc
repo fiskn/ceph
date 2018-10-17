@@ -21,9 +21,9 @@
 const static int dout_subsys = ceph_subsys_auth;
 
 
-AuthMethodList::AuthMethodList(CephContext *cct, string str)
+AuthMethodList::AuthMethodList(CephContext *cct, std::string str)
 {
-  list<string> sup_list;
+  std::list<std::string> sup_list;
   get_str_list(str, sup_list);
   if (sup_list.empty()) {
     lderr(cct) << "WARNING: empty auth protocol list" << dendl;
@@ -35,10 +35,12 @@ AuthMethodList::AuthMethodList(CephContext *cct, string str)
     } else if (iter->compare("none") == 0) {
       auth_supported.push_back(CEPH_AUTH_NONE);
     } else {
+      auth_supported.push_back(CEPH_AUTH_UNKNOWN);
       lderr(cct) << "WARNING: unknown auth protocol defined: " << *iter << dendl;
     }
   }
   if (auth_supported.empty()) {
+    lderr(cct) << "WARNING: no auth protocol defined, use 'cephx' by default" << dendl;
     auth_supported.push_back(CEPH_AUTH_CEPHX);
   }
 }

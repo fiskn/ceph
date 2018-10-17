@@ -22,8 +22,8 @@ struct JournalTrimmer::C_RemoveSet : public Context {
 
   C_RemoveSet(JournalTrimmer *_journal_trimmer, uint64_t _object_set,
               uint8_t _splay_width);
-  virtual void complete(int r);
-  virtual void finish(int r) {
+  void complete(int r) override;
+  void finish(int r) override {
     journal_trimmer->handle_set_removed(r, object_set);
     journal_trimmer->m_async_op_tracker.finish_op();
   }
@@ -43,14 +43,14 @@ JournalTrimmer::JournalTrimmer(librados::IoCtx &ioctx,
 }
 
 JournalTrimmer::~JournalTrimmer() {
-  assert(m_shutdown);
+  ceph_assert(m_shutdown);
 }
 
 void JournalTrimmer::shut_down(Context *on_finish) {
   ldout(m_cct, 20) << __func__ << dendl;
   {
     Mutex::Locker locker(m_lock);
-    assert(!m_shutdown);
+    ceph_assert(!m_shutdown);
     m_shutdown = true;
   }
 
@@ -79,8 +79,10 @@ void JournalTrimmer::remove_objects(bool force, Context *on_finish) {
 
         if (registered_clients.size() == 0) {
           on_finish->complete(-EINVAL);
+          return;
         } else if (registered_clients.size() > 1) {
           on_finish->complete(-EBUSY);
+          return;
         }
       }
 
@@ -101,7 +103,7 @@ void JournalTrimmer::committed(uint64_t commit_tid) {
 }
 
 void JournalTrimmer::trim_objects(uint64_t minimum_set) {
-  assert(m_lock.is_locked());
+  ceph_assert(m_lock.is_locked());
 
   ldout(m_cct, 20) << __func__ << ": min_set=" << minimum_set << dendl;
   if (minimum_set <= m_journal_metadata->get_minimum_set()) {
@@ -109,7 +111,7 @@ void JournalTrimmer::trim_objects(uint64_t minimum_set) {
   }
 
   if (m_remove_set_pending) {
-    m_remove_set = MAX(m_remove_set, minimum_set);
+    m_remove_set = std::max(m_remove_set, minimum_set);
     return;
   }
 
@@ -119,7 +121,7 @@ void JournalTrimmer::trim_objects(uint64_t minimum_set) {
 }
 
 void JournalTrimmer::remove_set(uint64_t object_set) {
-  assert(m_lock.is_locked());
+  ceph_assert(m_lock.is_locked());
 
   m_async_op_tracker.start_op();
   uint8_t splay_width = m_journal_metadata->get_splay_width();
@@ -138,7 +140,7 @@ void JournalTrimmer::remove_set(uint64_t object_set) {
       librados::Rados::aio_create_completion(ctx, NULL,
                                              utils::rados_ctx_callback);
     int r = m_ioctx.aio_remove(oid, comp);
-    assert(r == 0);
+    ceph_assert(r == 0);
     comp->release();
   }
 }

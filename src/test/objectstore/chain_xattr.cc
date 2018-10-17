@@ -23,6 +23,7 @@
 #include <signal.h>
 #include "os/filestore/chain_xattr.h"
 #include "include/Context.h"
+#include "include/coredumpctl.h"
 #include "common/errno.h"
 #include "common/ceph_argparse.h"
 #include "global/global_init.h"
@@ -120,6 +121,7 @@ TEST(chain_xattr, get_and_set) {
   {
     int x;
     const string name = user + string(CHAIN_XATTR_MAX_NAME_LEN * 2, '@');
+    PrCtl unset_dumpable;
     ASSERT_DEATH(chain_setxattr(file, name.c_str(), &x, sizeof(x)), "");
     ASSERT_DEATH(chain_fsetxattr(fd, name.c_str(), &x, sizeof(x)), "");
   }
@@ -323,7 +325,7 @@ list<string> get_xattrs(int fd)
   while (len > 0) {
     size_t next_len = strlen(buf);
     ret.push_back(string(buf, buf + next_len));
-    assert(len >= (int)(next_len + 1));
+    ceph_assert(len >= (int)(next_len + 1));
     buf += (next_len + 1);
     len -= (next_len + 1);
   }
@@ -346,10 +348,11 @@ TEST(chain_xattr, fskip_chain_cleanup_and_ensure_single_attr)
   const char *file = FILENAME;
   ::unlink(file);
   int fd = ::open(file, O_CREAT|O_RDWR|O_TRUNC, 0700);
+  ceph_assert(fd >= 0);
 
   std::size_t existing_xattrs = get_xattrs(fd).size();
   char buf[800];
-  memset(buf, sizeof(buf), 0x1F);
+  memset(buf, 0x1F, sizeof(buf));
   // set chunked without either
   {
     std::size_t r = chain_fsetxattr(fd, name, buf, sizeof(buf));
@@ -390,11 +393,12 @@ TEST(chain_xattr, skip_chain_cleanup_and_ensure_single_attr)
   const char *file = FILENAME;
   ::unlink(file);
   int fd = ::open(file, O_CREAT|O_RDWR|O_TRUNC, 0700);
+  ceph_assert(fd >= 0);
   std::size_t existing_xattrs = get_xattrs(fd).size();
   ::close(fd);
 
   char buf[3000];
-  memset(buf, sizeof(buf), 0x1F);
+  memset(buf, 0x1F, sizeof(buf));
   // set chunked without either
   {
     std::size_t r = chain_setxattr(file, name, buf, sizeof(buf));
@@ -433,11 +437,12 @@ int main(int argc, char **argv) {
   argv_to_vec(argc, (const char **)argv, args);
 
   auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
-			 CODE_ENVIRONMENT_UTILITY, 0);
+			 CODE_ENVIRONMENT_UTILITY,
+			 CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
   common_init_finish(g_ceph_context);
-  g_ceph_context->_conf->set_val("err_to_stderr", "false");
-  g_ceph_context->_conf->set_val("log_to_stderr", "false");
-  g_ceph_context->_conf->apply_changes(NULL);
+  g_ceph_context->_conf.set_val("err_to_stderr", "false");
+  g_ceph_context->_conf.set_val("log_to_stderr", "false");
+  g_ceph_context->_conf.apply_changes(nullptr);
 
   const char* file = FILENAME;
   int x = 1234;

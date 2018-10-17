@@ -27,7 +27,7 @@
 #include "common/ceph_argparse.h"
 #include "common/debug.h"
 #include "global/global_init.h"
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -189,8 +189,8 @@ TEST(LibRGW, INIT) {
 }
 
 TEST(LibRGW, MOUNT) {
-  int ret = rgw_mount(rgw_h, userid.c_str(), access_key.c_str(),
-		      secret_key.c_str(), &fs, RGW_MOUNT_FLAG_NONE);
+  int ret = rgw_mount2(rgw_h, userid.c_str(), access_key.c_str(),
+                       secret_key.c_str(), "/", &fs, RGW_MOUNT_FLAG_NONE);
   ASSERT_EQ(ret, 0);
   ASSERT_NE(fs, nullptr);
 
@@ -737,22 +737,21 @@ TEST(LibRGW, READF_DIRS1) {
       ofstream of;
       of.open(readf_out_name, ios::out|ios::app|ios::binary);
       int bufsz = 1024 * 1024 * sizeof(char);
-      char *buffer = (char*) malloc(bufsz);
+      auto buffer = std::make_unique<char[]>(bufsz);
 
       uint64_t offset = 0;
       uint64_t length = bufsz;
       for (int ix = 0; ix < 6; ++ix) {
 	size_t nread = 0;
-	memset(buffer, 0, length); // XXX
-	rc = rgw_read(fs, fobj.fh, offset, length, &nread, buffer,
+	memset(buffer.get(), 0, length); // XXX
+	rc = rgw_read(fs, fobj.fh, offset, length, &nread, buffer.get(),
 		      RGW_READ_FLAG_NONE);
 	ASSERT_EQ(rc, 0);
 	ASSERT_EQ(nread, length);
-	of.write(buffer, length);
+	of.write(buffer.get(), length);
 	offset += nread;
       }
       of.close();
-      free(buffer);
       rgw_fh_rele(fs, fobj.fh, 0 /* flags */);
     }
   }
@@ -853,7 +852,8 @@ TEST(LibRGW, RELEASE_DIRS1) {
 }
 
 extern "C" {
-  static bool r1_cb(const char* name, void *arg, uint64_t offset) {
+  static bool r1_cb(const char* name, void *arg, uint64_t offset,
+		    uint32_t flags) {
     struct rgw_file_handle* parent_fh
       = static_cast<struct rgw_file_handle*>(arg);
     RGWFileHandle* rgw_fh = get_rgwfh(parent_fh);
@@ -861,6 +861,7 @@ extern "C" {
 			   << " bucket=" << rgw_fh->bucket_name()
 			   << " dir=" << rgw_fh->full_object_name()
 			   << " called back name=" << name
+			   << " flags=" << flags
 			   << dendl;
     string name_str{name};
     if (! ((name_str == ".") ||
@@ -941,7 +942,7 @@ TEST(LibRGW, HIER1) {
 	  obj_stack.pop();
 	  break;
 	default:
-	  abort();
+	  ceph_abort();
 	};
       }
     }
@@ -1008,7 +1009,8 @@ TEST(LibRGW, MARKER1_SETUP_OBJECTS)
 }
 
 extern "C" {
-  static bool r2_cb(const char* name, void *arg, uint64_t offset) {
+  static bool r2_cb(const char* name, void *arg, uint64_t offset,
+		    uint32_t flags) {
     dirent_vec& dvec =
       *(static_cast<dirent_vec*>(arg));
     lsubdout(cct, rgw, 10) << __func__
@@ -1016,6 +1018,7 @@ extern "C" {
 			   << " dir=" << marker_dir
 			   << " iv count=" << dvec.count
 			   << " called back name=" << name
+			   << " flags=" << flags
 			   << dendl;
     string name_str{name};
     if (! ((name_str == ".") ||
@@ -1176,7 +1179,7 @@ int main(int argc, char *argv[])
     }
   }
 
-  /* dont accidentally run as anonymous */
+  /* don't accidentally run as anonymous */
   if ((access_key == "") ||
       (secret_key == "")) {
     std::cout << argv[0] << " no AWS credentials, exiting" << std::endl;

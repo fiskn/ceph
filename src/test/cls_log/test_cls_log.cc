@@ -31,10 +31,10 @@ static void reset_rop(librados::ObjectReadOperation **pop) {
 
 static int read_bl(bufferlist& bl, int *i)
 {
-  bufferlist::iterator iter = bl.begin();
+  auto iter = bl.cbegin();
 
   try {
-    ::decode(*i, iter);
+    decode(*i, iter);
   } catch (buffer::error& err) {
     std::cout << "failed to decode buffer" << std::endl;
     return -EIO;
@@ -46,7 +46,7 @@ static int read_bl(bufferlist& bl, int *i)
 void add_log(librados::ObjectWriteOperation *op, utime_t& timestamp, string& section, string&name, int i)
 {
   bufferlist bl;
-  ::encode(i, bl);
+  encode(i, bl);
 
   cls_log_add(*op, timestamp, section, name, bl);
 }
@@ -122,7 +122,7 @@ TEST(cls_rgw, test_log_add_same_time)
   ASSERT_EQ(0, ioctx.create(oid, true));
 
   /* generate log */
-  utime_t start_time = ceph_clock_now(g_ceph_context);
+  utime_t start_time = ceph_clock_now();
   generate_log(ioctx, oid, 10, start_time, false);
 
   librados::ObjectReadOperation *rop = new_rop();
@@ -209,7 +209,7 @@ TEST(cls_rgw, test_log_add_different_time)
   ASSERT_EQ(0, ioctx.create(oid, true));
 
   /* generate log */
-  utime_t start_time = ceph_clock_now(g_ceph_context);
+  utime_t start_time = ceph_clock_now();
   generate_log(ioctx, oid, 10, start_time, true);
 
   librados::ObjectReadOperation *rop = new_rop();
@@ -305,7 +305,7 @@ TEST(cls_rgw, test_log_trim)
   ASSERT_EQ(0, ioctx.create(oid, true));
 
   /* generate log */
-  utime_t start_time = ceph_clock_now(g_ceph_context);
+  utime_t start_time = ceph_clock_now();
   generate_log(ioctx, oid, 10, start_time, true);
 
   librados::ObjectReadOperation *rop = new_rop();

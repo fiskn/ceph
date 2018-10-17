@@ -43,6 +43,7 @@ class CephFSTestCase(CephTestCase):
     # FIXME weird explicit naming
     mount_a = None
     mount_b = None
+    recovery_mount = None
 
     # Declarative test requirements: subclasses should override these to indicate
     # their special needs.  If not met, tests will be skipped.
@@ -54,6 +55,9 @@ class CephFSTestCase(CephTestCase):
 
     # Whether to create the default filesystem during setUp
     REQUIRE_FILESYSTEM = True
+
+    # requires REQUIRE_FILESYSTEM = True
+    REQUIRE_RECOVERY_FILESYSTEM = False
 
     LOAD_SETTINGS = []
 
@@ -88,39 +92,24 @@ class CephFSTestCase(CephTestCase):
                 # here for hours waiting for the test to fill up a 1TB drive!
                 raise case.SkipTest("Require `memstore` OSD backend to simulate full drives")
 
-        # Unmount all surplus clients
-        for i in range(self.CLIENTS_REQUIRED, len(self.mounts)):
-            mount = self.mounts[i]
-            log.info("Unmounting unneeded client {0}".format(mount.client_id))
-            mount.umount_wait()
-
         # Create friendly mount_a, mount_b attrs
         for i in range(0, self.CLIENTS_REQUIRED):
             setattr(self, "mount_{0}".format(chr(ord('a') + i)), self.mounts[i])
 
         self.mds_cluster.clear_firewall()
 
-        # Unmount in order to start each test on a fresh mount, such
-        # that test_barrier can have a firm expectation of what OSD
-        # epoch the clients start with.
-        if self.mount_a.is_mounted():
-            self.mount_a.umount_wait()
-
-        if self.mount_b:
-            if self.mount_b.is_mounted():
-                self.mount_b.umount_wait()
+        # Unmount all clients, we are about to blow away the filesystem
+        for mount in self.mounts:
+            if mount.is_mounted():
+                mount.umount_wait(force=True)
 
         # To avoid any issues with e.g. unlink bugs, we destroy and recreate
         # the filesystem rather than just doing a rm -rf of files
         self.mds_cluster.mds_stop()
+        self.mds_cluster.mds_fail()
         self.mds_cluster.delete_all_filesystems()
         self.fs = None # is now invalid!
-
-        # In case the previous filesystem had filled up the RADOS cluster, wait for that
-        # flag to pass.
-        osd_mon_report_interval_max = int(self.mds_cluster.get_config("osd_mon_report_interval_max", service_type='osd'))
-        self.wait_until_true(lambda: not self.mds_cluster.is_full(),
-                             timeout=osd_mon_report_interval_max * 5)
+        self.recovery_fs = None
 
         # In case anything is in the OSD blacklist list, clear it out.  This is to avoid
         # the OSD map changing in the background (due to blacklist expiry) while tests run.
@@ -148,7 +137,7 @@ class CephFSTestCase(CephTestCase):
                 self.mds_cluster.mon_manager.raw_cluster_cmd("auth", "del", entry['entity'])
 
         if self.REQUIRE_FILESYSTEM:
-            self.fs = self.mds_cluster.newfs(True)
+            self.fs = self.mds_cluster.newfs(create=True)
             self.fs.mds_restart()
 
             # In case some test messed with auth caps, reset them
@@ -161,18 +150,29 @@ class CephFSTestCase(CephTestCase):
 
             # wait for mds restart to complete...
             self.fs.wait_for_daemons()
-            if not self.mount_a.is_mounted():
-                self.mount_a.mount()
-                self.mount_a.wait_until_mounted()
 
-            if self.mount_b:
-                if not self.mount_b.is_mounted():
-                    self.mount_b.mount()
-                    self.mount_b.wait_until_mounted()
+            # Mount the requested number of clients
+            for i in range(0, self.CLIENTS_REQUIRED):
+                self.mounts[i].mount()
+                self.mounts[i].wait_until_mounted()
+
+        if self.REQUIRE_RECOVERY_FILESYSTEM:
+            if not self.REQUIRE_FILESYSTEM:
+                raise case.SkipTest("Recovery filesystem requires a primary filesystem as well")
+            self.fs.mon_manager.raw_cluster_cmd('fs', 'flag', 'set',
+                                                'enable_multiple', 'true',
+                                                '--yes-i-really-mean-it')
+            self.recovery_fs = self.mds_cluster.newfs(name="recovery_fs", create=False)
+            self.recovery_fs.set_metadata_overlay(True)
+            self.recovery_fs.set_data_pool_name(self.fs.get_data_pool_name())
+            self.recovery_fs.create()
+            self.recovery_fs.getinfo(refresh=True)
+            self.recovery_fs.mds_restart()
+            self.recovery_fs.wait_for_daemons()
 
         # Load an config settings of interest
         for setting in self.LOAD_SETTINGS:
-            setattr(self, setting, int(self.fs.mds_asok(
+            setattr(self, setting, float(self.fs.mds_asok(
                 ['config', 'get', setting], self.mds_cluster.mds_ids[0]
             )[setting]))
 
@@ -197,18 +197,20 @@ class CephFSTestCase(CephTestCase):
 
     def auth_list(self):
         """
-        Convenience wrapper on "ceph auth list"
+        Convenience wrapper on "ceph auth ls"
         """
         return json.loads(self.mds_cluster.mon_manager.raw_cluster_cmd(
-            "auth", "list", "--format=json-pretty"
+            "auth", "ls", "--format=json-pretty"
         ))['auth_dump']
 
     def assert_session_count(self, expected, ls_data=None, mds_id=None):
         if ls_data is None:
             ls_data = self.fs.mds_asok(['session', 'ls'], mds_id=mds_id)
 
-        self.assertEqual(expected, len(ls_data), "Expected {0} sessions, found {1}".format(
-            expected, len(ls_data)
+        alive_count = len([s for s in ls_data if s['state'] != 'killing'])
+
+        self.assertEqual(expected, alive_count, "Expected {0} sessions, found {1}".format(
+            expected, alive_count
         ))
 
     def assert_session_state(self, client_id,  expected_state):
@@ -256,52 +258,33 @@ class CephFSTestCase(CephTestCase):
             ))
             raise
 
-    def assert_mds_crash(self, daemon_id):
-        """
-        Assert that the a particular MDS daemon crashes (block until
-        it does)
-        """
-        try:
-            self.mds_cluster.mds_daemons[daemon_id].proc.wait()
-        except CommandFailedError as e:
-            log.info("MDS '{0}' crashed with status {1} as expected".format(daemon_id, e.exitstatus))
-            self.mds_cluster.mds_daemons[daemon_id].proc = None
+    def delete_mds_coredump(self, daemon_id):
+        # delete coredump file, otherwise teuthology.internal.coredump will
+        # catch it later and treat it as a failure.
+        p = self.mds_cluster.mds_daemons[daemon_id].remote.run(args=[
+            "sudo", "sysctl", "-n", "kernel.core_pattern"], stdout=StringIO())
+        core_dir = os.path.dirname(p.stdout.getvalue().strip())
+        if core_dir:  # Non-default core_pattern with a directory in it
+            # We have seen a core_pattern that looks like it's from teuthology's coredump
+            # task, so proceed to clear out the core file
+            log.info("Clearing core from directory: {0}".format(core_dir))
 
-            # Go remove the coredump from the crash, otherwise teuthology.internal.coredump will
-            # catch it later and treat it as a failure.
-            p = self.mds_cluster.mds_daemons[daemon_id].remote.run(args=[
-                "sudo", "sysctl", "-n", "kernel.core_pattern"], stdout=StringIO())
-            core_pattern = p.stdout.getvalue().strip()
-            if os.path.dirname(core_pattern):  # Non-default core_pattern with a directory in it
-                # We have seen a core_pattern that looks like it's from teuthology's coredump
-                # task, so proceed to clear out the core file
-                log.info("Clearing core from pattern: {0}".format(core_pattern))
+            # Verify that we see the expected single coredump
+            ls_proc = self.mds_cluster.mds_daemons[daemon_id].remote.run(args=[
+                "cd", core_dir, run.Raw('&&'),
+                "sudo", "ls", run.Raw('|'), "sudo", "xargs", "file"
+            ], stdout=StringIO())
+            cores = [l.partition(":")[0]
+                     for l in ls_proc.stdout.getvalue().strip().split("\n")
+                     if re.match(r'.*ceph-mds.* -i +{0}'.format(daemon_id), l)]
 
-                # Determine the PID of the crashed MDS by inspecting the MDSMap, it had
-                # to talk to the mons to get assigned a rank to reach the point of crashing
-                addr = self.mds_cluster.mon_manager.get_mds_status(daemon_id)['addr']
-                pid_str = addr.split("/")[1]
-                log.info("Determined crasher PID was {0}".format(pid_str))
+            log.info("Enumerated cores: {0}".format(cores))
+            self.assertEqual(len(cores), 1)
 
-                # Substitute PID into core_pattern to get a glob
-                core_glob = core_pattern.replace("%p", pid_str)
-                core_glob = re.sub("%[a-z]", "*", core_glob)  # Match all for all other % tokens
+            log.info("Found core file {0}, deleting it".format(cores[0]))
 
-                # Verify that we see the expected single coredump matching the expected pattern
-                ls_proc = self.mds_cluster.mds_daemons[daemon_id].remote.run(args=[
-                    "sudo", "ls", run.Raw(core_glob)
-                ], stdout=StringIO())
-                cores = [f for f in ls_proc.stdout.getvalue().strip().split("\n") if f]
-                log.info("Enumerated cores: {0}".format(cores))
-                self.assertEqual(len(cores), 1)
-
-                log.info("Found core file {0}, deleting it".format(cores[0]))
-
-                self.mds_cluster.mds_daemons[daemon_id].remote.run(args=[
-                    "sudo", "rm", "-f", cores[0]
-                ])
-            else:
-                log.info("No core_pattern directory set, nothing to clear (internal.coredump not enabled?)")
-
+            self.mds_cluster.mds_daemons[daemon_id].remote.run(args=[
+                "cd", core_dir, run.Raw('&&'), "sudo", "rm", "-f", cores[0]
+            ])
         else:
-            raise AssertionError("MDS daemon '{0}' did not crash as expected".format(daemon_id))
+            log.info("No core_pattern directory set, nothing to clear (internal.coredump not enabled?)")

@@ -17,7 +17,6 @@
 
 #include "include/unordered_map.h"
 #include <boost/tuple/tuple.hpp>
-#include "include/memory.h"
 #include "common/Formatter.h"
 #include "common/hobject.h"
 #include "include/interval_set.h"
@@ -90,7 +89,7 @@ class WBThrottle : Thread, public md_config_obs_t {
   list<ghobject_t> lru;
   ceph::unordered_map<ghobject_t, list<ghobject_t>::iterator> rev_lru;
   void remove_object(const ghobject_t &oid) {
-    assert(lock.is_locked());
+    ceph_assert(lock.is_locked());
     ceph::unordered_map<ghobject_t, list<ghobject_t>::iterator>::iterator iter =
       rev_lru.find(oid);
     if (iter == rev_lru.end())
@@ -100,14 +99,14 @@ class WBThrottle : Thread, public md_config_obs_t {
     rev_lru.erase(iter);
   }
   ghobject_t pop_object() {
-    assert(!lru.empty());
+    ceph_assert(!lru.empty());
     ghobject_t oid(lru.front());
     lru.pop_front();
     rev_lru.erase(oid);
     return oid;
   }
   void insert_object(const ghobject_t &oid) {
-    assert(rev_lru.find(oid) == rev_lru.end());
+    ceph_assert(rev_lru.find(oid) == rev_lru.end());
     lru.push_back(oid);
     rev_lru.insert(make_pair(oid, --lru.end()));
   }
@@ -147,7 +146,7 @@ private:
 
 public:
   explicit WBThrottle(CephContext *cct);
-  ~WBThrottle();
+  ~WBThrottle() override;
 
   void start();
   void stop();
@@ -177,12 +176,12 @@ public:
   void throttle();
 
   /// md_config_obs_t
-  const char** get_tracked_conf_keys() const;
-  void handle_conf_change(const md_config_t *conf,
-			  const std::set<std::string> &changed);
+  const char** get_tracked_conf_keys() const override;
+  void handle_conf_change(const ConfigProxy& conf,
+			  const std::set<std::string> &changed) override;
 
   /// Thread
-  void *entry();
+  void *entry() override;
 };
 
 #endif

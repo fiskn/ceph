@@ -7,21 +7,24 @@
 #include "common/dout.h"
 #include "common/Mutex.h"
 #include "common/WorkQueue.h"
+#include "osdc/Striper.h"
 #include "include/Context.h"
 #include "include/rados/librados.hpp"
 #include "include/rbd/librbd.hpp"
 
-#include "librbd/AioObjectRequest.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/internal.h"
 #include "librbd/LibrbdWriteback.h"
-#include "librbd/AioCompletion.h"
 #include "librbd/ObjectMap.h"
 #include "librbd/Journal.h"
 #include "librbd/Utils.h"
+#include "librbd/io/AioCompletion.h"
+#include "librbd/io/ObjectDispatchSpec.h"
+#include "librbd/io/ObjectDispatcher.h"
+#include "librbd/io/ReadResult.h"
 
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -53,7 +56,7 @@ namespace librbd {
     C_ReadRequest(CephContext *cct, Context *c, Mutex *cache_lock)
       : m_cct(cct), m_ctx(c), m_cache_lock(cache_lock) {
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       ldout(m_cct, 20) << "aio_cb completing " << dendl;
       {
         Mutex::Locker cache_locker(*m_cache_lock);
@@ -70,96 +73,26 @@ namespace librbd {
   class C_OrderedWrite : public Context {
   public:
     C_OrderedWrite(CephContext *cct, LibrbdWriteback::write_result_d *result,
-		   LibrbdWriteback *wb)
-      : m_cct(cct), m_result(result), m_wb_handler(wb) {}
-    virtual ~C_OrderedWrite() {}
-    virtual void finish(int r) {
+		   const ZTracer::Trace &trace, LibrbdWriteback *wb)
+      : m_cct(cct), m_result(result), m_trace(trace), m_wb_handler(wb) {}
+    ~C_OrderedWrite() override {}
+    void finish(int r) override {
       ldout(m_cct, 20) << "C_OrderedWrite completing " << m_result << dendl;
       {
 	Mutex::Locker l(m_wb_handler->m_lock);
-	assert(!m_result->done);
+	ceph_assert(!m_result->done);
 	m_result->done = true;
 	m_result->ret = r;
 	m_wb_handler->complete_writes(m_result->oid);
       }
       ldout(m_cct, 20) << "C_OrderedWrite finished " << m_result << dendl;
+      m_trace.event("finish");
     }
   private:
     CephContext *m_cct;
     LibrbdWriteback::write_result_d *m_result;
+    ZTracer::Trace m_trace;
     LibrbdWriteback *m_wb_handler;
-  };
-
-  struct C_WriteJournalCommit : public Context {
-    typedef std::vector<std::pair<uint64_t,uint64_t> > Extents;
-
-    ImageCtx *image_ctx;
-    std::string oid;
-    uint64_t object_no;
-    uint64_t off;
-    bufferlist bl;
-    SnapContext snapc;
-    Context *req_comp;
-    uint64_t journal_tid;
-    bool request_sent;
-
-    C_WriteJournalCommit(ImageCtx *_image_ctx, const std::string &_oid,
-                         uint64_t _object_no, uint64_t _off,
-                         const bufferlist &_bl, const SnapContext& _snapc,
-                         Context *_req_comp, uint64_t _journal_tid)
-      : image_ctx(_image_ctx), oid(_oid), object_no(_object_no), off(_off),
-        bl(_bl), snapc(_snapc), req_comp(_req_comp), journal_tid(_journal_tid),
-        request_sent(false) {
-      CephContext *cct = image_ctx->cct;
-      ldout(cct, 20) << this << " C_WriteJournalCommit: "
-                     << "delaying write until journal tid "
-                     << journal_tid << " safe" << dendl;
-    }
-
-    virtual void complete(int r) {
-      if (request_sent || r < 0) {
-        commit_io_event_extent(r);
-        req_comp->complete(r);
-        delete this;
-      } else {
-        send_request();
-      }
-    }
-
-    virtual void finish(int r) {
-    }
-
-    void commit_io_event_extent(int r) {
-      CephContext *cct = image_ctx->cct;
-      ldout(cct, 20) << this << " C_WriteJournalCommit: "
-                     << "write committed: updating journal commit position"
-                     << dendl;
-
-      // all IO operations are flushed prior to closing the journal
-      assert(image_ctx->journal != NULL);
-
-      Extents file_extents;
-      Striper::extent_to_file(cct, &image_ctx->layout, object_no, off,
-                              bl.length(), file_extents);
-      for (Extents::iterator it = file_extents.begin();
-           it != file_extents.end(); ++it) {
-        image_ctx->journal->commit_io_event_extent(journal_tid, it->first,
-                                                   it->second, r);
-      }
-    }
-
-    void send_request() {
-      CephContext *cct = image_ctx->cct;
-      ldout(cct, 20) << this << " C_WriteJournalCommit: "
-                     << "journal committed: sending write request" << dendl;
-
-      assert(image_ctx->exclusive_lock->is_lock_owner());
-
-      request_sent = true;
-      AioObjectWrite *req = new AioObjectWrite(image_ctx, oid, object_no, off,
-                                               bl, snapc, this, 0);
-      req->send();
-    }
   };
 
   struct C_CommitIOEventExtent : public Context {
@@ -174,9 +107,9 @@ namespace librbd {
         length(length) {
     }
 
-    virtual void finish(int r) {
+    void finish(int r) override {
       // all IO operations are flushed prior to closing the journal
-      assert(image_ctx->journal != nullptr);
+      ceph_assert(image_ctx->journal != nullptr);
 
       image_ctx->journal->commit_io_event_extent(journal_tid, offset, length,
                                                  r);
@@ -191,31 +124,33 @@ namespace librbd {
 			     const object_locator_t& oloc,
 			     uint64_t off, uint64_t len, snapid_t snapid,
 			     bufferlist *pbl, uint64_t trunc_size,
-			     __u32 trunc_seq, int op_flags, Context *onfinish)
+			     __u32 trunc_seq, int op_flags,
+                             const ZTracer::Trace &parent_trace,
+                             Context *onfinish)
   {
-    // on completion, take the mutex and then call onfinish.
-    Context *req = new C_ReadRequest(m_ictx->cct, onfinish, &m_lock);
-
-    {
-      RWLock::RLocker snap_locker(m_ictx->snap_lock);
-      if (m_ictx->object_map != nullptr &&
-          !m_ictx->object_map->object_may_exist(object_no)) {
-        m_ictx->op_work_queue->queue(req, -ENOENT);
-	return;
-      }
+    ZTracer::Trace trace;
+    if (parent_trace.valid()) {
+      trace.init("", &m_ictx->trace_endpoint, &parent_trace);
+      trace.copy_name("cache read " + oid.name);
+      trace.event("start");
     }
 
-    librados::ObjectReadOperation op;
-    op.read(off, len, pbl, NULL);
-    op.set_op_flags2(op_flags);
-    int flags = m_ictx->get_read_flags(snapid);
+    // on completion, take the mutex and then call onfinish.
+    onfinish = new C_ReadRequest(m_ictx->cct, onfinish, &m_lock);
 
-    librados::AioCompletion *rados_completion =
-      util::create_rados_ack_callback(req);
-    int r = m_ictx->data_ctx.aio_operate(oid.name, rados_completion, &op,
-					 flags, NULL);
-    rados_completion->release();
-    assert(r >= 0);
+    // re-use standard object read state machine
+    auto aio_comp = io::AioCompletion::create_and_start(onfinish, m_ictx,
+                                                        io::AIO_TYPE_READ);
+    aio_comp->read_result = io::ReadResult{pbl};
+    aio_comp->set_request_count(1);
+
+    auto req_comp = new io::ReadResult::C_ObjectReadRequest(
+      aio_comp, off, len, {{0, len}});
+
+    auto req = io::ObjectDispatchSpec::create_read(
+      m_ictx, io::OBJECT_DISPATCH_LAYER_CACHE, oid.name, object_no, off, len,
+      snapid, op_flags, trace, &req_comp->bl, &req_comp->extent_map, req_comp);
+    req->send();
   }
 
   bool LibrbdWriteback::may_copy_on_write(const object_t& oid, uint64_t read_off, uint64_t read_len, snapid_t snapid)
@@ -249,27 +184,35 @@ namespace librbd {
 				    const bufferlist &bl,
 				    ceph::real_time mtime, uint64_t trunc_size,
 				    __u32 trunc_seq, ceph_tid_t journal_tid,
+                                    const ZTracer::Trace &parent_trace,
 				    Context *oncommit)
   {
+    ZTracer::Trace trace;
+    if (parent_trace.valid()) {
+      trace.init("", &m_ictx->trace_endpoint, &parent_trace);
+      trace.copy_name("writeback " + oid.name);
+      trace.event("start");
+    }
+
     uint64_t object_no = oid_to_object_no(oid.name, m_ictx->object_prefix);
 
     write_result_d *result = new write_result_d(oid.name, oncommit);
     m_writes[oid.name].push(result);
     ldout(m_ictx->cct, 20) << "write will wait for result " << result << dendl;
-    C_OrderedWrite *req_comp = new C_OrderedWrite(m_ictx->cct, result, this);
 
-    // all IO operations are flushed prior to closing the journal
-    assert(journal_tid == 0 || m_ictx->journal != NULL);
-    if (journal_tid != 0) {
-      m_ictx->journal->flush_event(
-        journal_tid, new C_WriteJournalCommit(m_ictx, oid.name, object_no, off,
-                                              bl, snapc, req_comp,
-					      journal_tid));
-    } else {
-      AioObjectWrite *req = new AioObjectWrite(m_ictx, oid.name, object_no,
-					       off, bl, snapc, req_comp, 0);
-      req->send();
-    }
+    bufferlist bl_copy(bl);
+
+    Context *ctx = new C_OrderedWrite(m_ictx->cct, result, trace, this);
+    ctx = util::create_async_context_callback(*m_ictx, ctx);
+
+    auto req = io::ObjectDispatchSpec::create_write(
+      m_ictx, io::OBJECT_DISPATCH_LAYER_CACHE, oid.name, object_no, off,
+      std::move(bl_copy), snapc, 0, journal_tid, trace, ctx);
+    req->object_dispatch_flags = (
+      io::OBJECT_DISPATCH_FLAG_FLUSH |
+      io::OBJECT_DISPATCH_FLAG_WILL_RETRY_ON_ERROR);
+    req->send();
+
     return ++m_tid;
   }
 
@@ -288,7 +231,7 @@ namespace librbd {
     uint64_t object_no = oid_to_object_no(oid.name, m_ictx->object_prefix);
 
     // all IO operations are flushed prior to closing the journal
-    assert(original_journal_tid != 0 && m_ictx->journal != NULL);
+    ceph_assert(original_journal_tid != 0 && m_ictx->journal != NULL);
 
     Extents file_extents;
     Striper::extent_to_file(m_ictx->cct, &m_ictx->layout, object_no, off,
@@ -311,7 +254,7 @@ namespace librbd {
 
   void LibrbdWriteback::complete_writes(const std::string& oid)
   {
-    assert(m_lock.is_locked());
+    ceph_assert(m_lock.is_locked());
     std::queue<write_result_d*>& results = m_writes[oid];
     ldout(m_ictx->cct, 20) << "complete_writes() oid " << oid << dendl;
     std::list<write_result_d*> finished;

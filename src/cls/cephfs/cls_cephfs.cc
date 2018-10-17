@@ -15,7 +15,6 @@
 
 #include <string>
 #include <errno.h>
-#include <sstream>
 
 #include "objclass/objclass.h"
 
@@ -39,7 +38,7 @@ std::ostream &operator<<(std::ostream &out, const ObjCeiling &in)
  * If the xattr is missing, then it is set to the input integer.
  *
  * @param xattr_name: name of xattr to compare against and set
- * @param input_val: candidate new value, of ::encode()'able type
+ * @param input_val: candidate new value, of encode()'able type
  * @returns 0 on success (irrespective of whether our new value
  *          was used) else an error code
  */
@@ -54,10 +53,10 @@ static int set_if_greater(cls_method_context_t hctx,
   if (r == -ENOENT || existing_val_bl.length() == 0) {
     set_val = true;
   } else if (r >= 0) {
-    bufferlist::iterator existing_p = existing_val_bl.begin();
+    auto existing_p = existing_val_bl.cbegin();
     try {
       A existing_val;
-      ::decode(existing_val, existing_p);
+      decode(existing_val, existing_p);
       if (!existing_p.end()) {
         // Trailing junk?  Consider it invalid and overwrite
         set_val = true;
@@ -76,7 +75,7 @@ static int set_if_greater(cls_method_context_t hctx,
   // Conditionally set the new xattr
   if (set_val) {
     bufferlist set_bl;
-    ::encode(input_val, set_bl);
+    encode(input_val, set_bl);
     return cls_cxx_setxattr(hctx, xattr_name.c_str(), &set_bl);
   } else {
     return 0;
@@ -86,13 +85,13 @@ static int set_if_greater(cls_method_context_t hctx,
 static int accumulate_inode_metadata(cls_method_context_t hctx,
     bufferlist *in, bufferlist *out)
 {
-  assert(in != NULL);
-  assert(out != NULL);
+  ceph_assert(in != NULL);
+  ceph_assert(out != NULL);
 
   int r = 0;
 
   // Decode `in`
-  bufferlist::iterator q = in->begin();
+  auto q = in->cbegin();
   AccumulateArgs args;
   try {
     args.decode(q);
@@ -127,7 +126,7 @@ class PGLSCephFSFilter : public PGLSFilter {
 protected:
   std::string scrub_tag;
 public:
-  int init(bufferlist::iterator& params) {
+  int init(bufferlist::const_iterator& params) override {
     try {
       InodeTagFilterArgs args;
       args.decode(params);
@@ -145,10 +144,10 @@ public:
     return 0;
   }
 
-  virtual ~PGLSCephFSFilter() {}
-  virtual bool reject_empty_xattr() { return false; }
-  virtual bool filter(const hobject_t &obj, bufferlist& xattr_data,
-                      bufferlist& outdata);
+  ~PGLSCephFSFilter() override {}
+  bool reject_empty_xattr() override { return false; }
+  bool filter(const hobject_t &obj, bufferlist& xattr_data,
+                      bufferlist& outdata) override;
 };
 
 bool PGLSCephFSFilter::filter(const hobject_t &obj,
@@ -168,9 +167,9 @@ bool PGLSCephFSFilter::filter(const hobject_t &obj,
 
   if (!scrub_tag.empty() && xattr_data.length() > 0) {
     std::string tag_ondisk;
-    bufferlist::iterator q = xattr_data.begin();
+    auto q = xattr_data.cbegin();
     try {
-      ::decode(tag_ondisk, q);
+      decode(tag_ondisk, q);
       if (tag_ondisk == scrub_tag)
 	return false;
     } catch (const buffer::error &err) {

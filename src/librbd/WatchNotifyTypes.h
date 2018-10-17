@@ -7,6 +7,7 @@
 #include "include/int_types.h"
 #include "include/buffer_fwd.h"
 #include "include/encoding.h"
+#include "librbd/watcher/Types.h"
 #include <iosfwd>
 #include <list>
 #include <string>
@@ -19,35 +20,9 @@ class Formatter;
 namespace librbd {
 namespace watch_notify {
 
-struct ClientId {
-  uint64_t gid;
-  uint64_t handle;
+using librbd::watcher::ClientId;
 
-  ClientId() : gid(0), handle(0) {}
-  ClientId(uint64_t gid_, uint64_t handle_) : gid(gid_), handle(handle_) {}
-
-  void encode(bufferlist& bl) const;
-  void decode(bufferlist::iterator& it);
-  void dump(Formatter *f) const;
-
-  inline bool is_valid() const {
-    return (*this != ClientId());
-  }
-
-  inline bool operator==(const ClientId &rhs) const {
-    return (gid == rhs.gid && handle == rhs.handle);
-  }
-  inline bool operator!=(const ClientId &rhs) const {
-    return !(*this == rhs);
-  }
-  inline bool operator<(const ClientId &rhs) const {
-    if (gid != rhs.gid) {
-      return gid < rhs.gid;
-    } else {
-      return handle < rhs.handle;
-    }
-  }
-};
+WRITE_CLASS_ENCODER(ClientId);
 
 struct AsyncRequestId {
   ClientId client_id;
@@ -58,7 +33,7 @@ struct AsyncRequestId {
     : client_id(client_id_), request_id(request_id_) {}
 
   void encode(bufferlist& bl) const;
-  void decode(bufferlist::iterator& it);
+  void decode(bufferlist::const_iterator& it);
   void dump(Formatter *f) const;
 
   inline bool operator<(const AsyncRequestId &rhs) const {
@@ -90,6 +65,7 @@ enum NotifyOp {
   NOTIFY_OP_SNAP_UNPROTECT     = 13,
   NOTIFY_OP_RENAME             = 14,
   NOTIFY_OP_UPDATE_FEATURES    = 15,
+  NOTIFY_OP_MIGRATE            = 16,
 };
 
 struct AcquiredLockPayload {
@@ -102,7 +78,7 @@ struct AcquiredLockPayload {
   AcquiredLockPayload(const ClientId &client_id_) : client_id(client_id_) {}
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 };
 
@@ -116,7 +92,7 @@ struct ReleasedLockPayload {
   ReleasedLockPayload(const ClientId &client_id_) : client_id(client_id_) {}
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 };
 
@@ -133,7 +109,7 @@ struct RequestLockPayload {
   }
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 };
 
@@ -142,7 +118,7 @@ struct HeaderUpdatePayload {
   static const bool CHECK_FOR_REFRESH = false;
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 };
 
@@ -151,7 +127,7 @@ public:
   AsyncRequestId async_request_id;
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 
 protected:
@@ -171,7 +147,7 @@ struct AsyncProgressPayload : public AsyncRequestPayloadBase {
   uint64_t total;
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 };
 
@@ -186,7 +162,7 @@ struct AsyncCompletePayload : public AsyncRequestPayloadBase {
   int result;
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 };
 
@@ -210,7 +186,7 @@ struct ResizePayload : public AsyncRequestPayloadBase {
   bool allow_shrink;
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 };
 
@@ -218,28 +194,30 @@ struct SnapPayloadBase {
 public:
   static const bool CHECK_FOR_REFRESH = true;
 
+  cls::rbd::SnapshotNamespace snap_namespace;
   std::string snap_name;
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 
 protected:
   SnapPayloadBase() {}
-  SnapPayloadBase(const std::string &name) : snap_name(name) {}
+  SnapPayloadBase(const cls::rbd::SnapshotNamespace& _snap_namespace,
+		  const std::string &name)
+    : snap_namespace(_snap_namespace), snap_name(name) {}
 };
 
 struct SnapCreatePayload : public SnapPayloadBase {
   static const NotifyOp NOTIFY_OP = NOTIFY_OP_SNAP_CREATE;
 
   SnapCreatePayload() {}
-  SnapCreatePayload(const std::string &name,
-		    const cls::rbd::SnapshotNamespace &_snap_namespace) : SnapPayloadBase(name), snap_namespace(_snap_namespace) {}
-
-  cls::rbd::SnapshotNamespace snap_namespace;
+  SnapCreatePayload(const cls::rbd::SnapshotNamespace &_snap_namespace,
+		    const std::string &name)
+    : SnapPayloadBase(_snap_namespace, name) {}
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 };
 
@@ -247,13 +225,14 @@ struct SnapRenamePayload : public SnapPayloadBase {
   static const NotifyOp NOTIFY_OP = NOTIFY_OP_SNAP_RENAME;
 
   SnapRenamePayload() {}
-  SnapRenamePayload(const uint64_t &src_snap_id, const std::string &dst_name)
-    : SnapPayloadBase(dst_name), snap_id(src_snap_id) {}
+  SnapRenamePayload(const uint64_t &src_snap_id,
+		    const std::string &dst_name)
+    : SnapPayloadBase(cls::rbd::UserSnapshotNamespace(), dst_name), snap_id(src_snap_id) {}
 
-  uint64_t snap_id;
+  uint64_t snap_id = 0;
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 };
 
@@ -261,21 +240,27 @@ struct SnapRemovePayload : public SnapPayloadBase {
   static const NotifyOp NOTIFY_OP = NOTIFY_OP_SNAP_REMOVE;
 
   SnapRemovePayload() {}
-  SnapRemovePayload(const std::string &name) : SnapPayloadBase(name) {}
+  SnapRemovePayload(const cls::rbd::SnapshotNamespace& snap_namespace,
+		    const std::string &name)
+    : SnapPayloadBase(snap_namespace, name) {}
 };
 
 struct SnapProtectPayload : public SnapPayloadBase {
   static const NotifyOp NOTIFY_OP = NOTIFY_OP_SNAP_PROTECT;
 
   SnapProtectPayload() {}
-  SnapProtectPayload(const std::string &name) : SnapPayloadBase(name) {}
+  SnapProtectPayload(const cls::rbd::SnapshotNamespace& snap_namespace,
+		     const std::string &name)
+    : SnapPayloadBase(snap_namespace, name) {}
 };
 
 struct SnapUnprotectPayload : public SnapPayloadBase {
   static const NotifyOp NOTIFY_OP = NOTIFY_OP_SNAP_UNPROTECT;
 
   SnapUnprotectPayload() {}
-  SnapUnprotectPayload(const std::string &name) : SnapPayloadBase(name) {}
+  SnapUnprotectPayload(const cls::rbd::SnapshotNamespace& snap_namespace,
+		       const std::string &name)
+    : SnapPayloadBase(snap_namespace, name) {}
 };
 
 struct RebuildObjectMapPayload : public AsyncRequestPayloadBase {
@@ -297,7 +282,7 @@ struct RenamePayload {
   std::string image_name;
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 };
 
@@ -313,8 +298,16 @@ struct UpdateFeaturesPayload {
   bool enabled;
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
+};
+
+struct MigratePayload : public AsyncRequestPayloadBase {
+  static const NotifyOp NOTIFY_OP = NOTIFY_OP_MIGRATE;
+  static const bool CHECK_FOR_REFRESH = true;
+
+  MigratePayload() {}
+  MigratePayload(const AsyncRequestId &id) : AsyncRequestPayloadBase(id) {}
 };
 
 struct UnknownPayload {
@@ -322,7 +315,7 @@ struct UnknownPayload {
   static const bool CHECK_FOR_REFRESH = false;
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &iter);
+  void decode(__u8 version, bufferlist::const_iterator &iter);
   void dump(Formatter *f) const;
 };
 
@@ -342,6 +335,7 @@ typedef boost::variant<AcquiredLockPayload,
                        RebuildObjectMapPayload,
                        RenamePayload,
                        UpdateFeaturesPayload,
+                       MigratePayload,
                        UnknownPayload> Payload;
 
 struct NotifyMessage {
@@ -353,8 +347,9 @@ struct NotifyMessage {
   bool check_for_refresh() const;
 
   void encode(bufferlist& bl) const;
-  void decode(bufferlist::iterator& it);
+  void decode(bufferlist::const_iterator& it);
   void dump(Formatter *f) const;
+  NotifyOp get_notify_op() const;
 
   static void generate_test_instances(std::list<NotifyMessage *> &o);
 };
@@ -366,25 +361,23 @@ struct ResponseMessage {
   int result;
 
   void encode(bufferlist& bl) const;
-  void decode(bufferlist::iterator& it);
+  void decode(bufferlist::const_iterator& it);
   void dump(Formatter *f) const;
 
   static void generate_test_instances(std::list<ResponseMessage *> &o);
 };
 
+std::ostream &operator<<(std::ostream &out,
+                         const NotifyOp &op);
+std::ostream &operator<<(std::ostream &out,
+                         const AsyncRequestId &request);
+
+WRITE_CLASS_ENCODER(AsyncRequestId);
+WRITE_CLASS_ENCODER(NotifyMessage);
+WRITE_CLASS_ENCODER(ResponseMessage);
+
 } // namespace watch_notify
 } // namespace librbd
 
-std::ostream &operator<<(std::ostream &out,
-                         const librbd::watch_notify::NotifyOp &op);
-std::ostream &operator<<(std::ostream &out,
-                         const librbd::watch_notify::ClientId &client);
-std::ostream &operator<<(std::ostream &out,
-                         const librbd::watch_notify::AsyncRequestId &request);
-
-WRITE_CLASS_ENCODER(librbd::watch_notify::ClientId);
-WRITE_CLASS_ENCODER(librbd::watch_notify::AsyncRequestId);
-WRITE_CLASS_ENCODER(librbd::watch_notify::NotifyMessage);
-WRITE_CLASS_ENCODER(librbd::watch_notify::ResponseMessage);
 
 #endif // LIBRBD_WATCH_NOTIFY_TYPES_H

@@ -11,8 +11,8 @@ class RGWAsioFrontend : public RGWFrontend {
   class Impl;
   std::unique_ptr<Impl> impl;
 public:
-  RGWAsioFrontend(const RGWProcessEnv& env);
-  ~RGWAsioFrontend();
+  RGWAsioFrontend(const RGWProcessEnv& env, RGWFrontendConfig* conf);
+  ~RGWAsioFrontend() override;
 
   int init() override;
   int run() override;
@@ -20,7 +20,8 @@ public:
   void join() override;
 
   void pause_for_new_config() override;
-  void unpause_with_new_config(RGWRados *store) override;
+  void unpause_with_new_config(RGWRados *store,
+                               rgw_auth_registry_ptr_t auth_registry) override;
 };
 
 #endif // RGW_ASIO_FRONTEND_H

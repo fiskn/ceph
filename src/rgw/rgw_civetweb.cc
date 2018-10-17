@@ -29,22 +29,44 @@ size_t RGWCivetWeb::write_data(const char *buf, const size_t len)
   return len;
 }
 
-RGWCivetWeb::RGWCivetWeb(mg_connection* const conn, const int port)
+RGWCivetWeb::RGWCivetWeb(mg_connection* const conn)
   : conn(conn),
-    port(port),
     explicit_keepalive(false),
     explicit_conn_close(false),
+    got_eof_on_read(false),
     txbuf(*this)
 {
+    sockaddr *lsa = mg_get_local_addr(conn);
+    switch(lsa->sa_family) {
+    case AF_INET:
+	port = ntohs(((struct sockaddr_in*)lsa)->sin_port);
+	break;
+    case AF_INET6:
+	port = ntohs(((struct sockaddr_in6*)lsa)->sin6_port);
+	break;
+    default:
+	port = -1;
+    }
 }
 
 size_t RGWCivetWeb::read_data(char *buf, size_t len)
 {
-  const int ret = mg_read(conn, buf, len);
-  if (ret < 0) {
-    throw rgw::io::Exception(EIO, std::system_category());
+  size_t c;
+  int ret;
+  if (got_eof_on_read) {
+    return 0;
   }
-  return ret;
+  for (c = 0; c < len; c += ret) {
+    ret = mg_read(conn, buf+c, len-c);
+    if (ret < 0) {
+      throw rgw::io::Exception(EIO, std::system_category());
+    }
+    if (!ret) {
+      got_eof_on_read = true;
+      break;
+    }
+  }
+  return c;
 }
 
 void RGWCivetWeb::flush()
@@ -54,20 +76,29 @@ void RGWCivetWeb::flush()
 
 size_t RGWCivetWeb::complete_request()
 {
+  perfcounter->inc(l_rgw_qlen, -1);
+  perfcounter->inc(l_rgw_qactive, -1);
   return 0;
 }
 
-void RGWCivetWeb::init_env(CephContext *cct)
+int RGWCivetWeb::init_env(CephContext *cct)
 {
   env.init(cct);
   const struct mg_request_info* info = mg_get_request_info(conn);
 
   if (! info) {
-    return;
+    // request info is NULL; we have no info about the connection
+    return -EINVAL;
   }
 
   for (int i = 0; i < info->num_headers; i++) {
-    const struct mg_request_info::mg_header* header = &info->http_headers[i];
+    const auto header = &info->http_headers[i];
+
+    if (header->name == nullptr || header->value==nullptr) {
+      lderr(cct) << "client supplied malformatted headers" << dendl;
+      return -EINVAL;
+    }
+
     const boost::string_ref name(header->name);
     const auto& value = header->value;
 
@@ -100,9 +131,14 @@ void RGWCivetWeb::init_env(CephContext *cct)
     env.set(buf, value);
   }
 
+  perfcounter->inc(l_rgw_qlen);
+  perfcounter->inc(l_rgw_qactive);
+
+  env.set("REMOTE_ADDR", info->remote_addr);
   env.set("REQUEST_METHOD", info->request_method);
-  env.set("REQUEST_URI", info->uri);
-  env.set("SCRIPT_URI", info->uri); /* FIXME */
+  env.set("HTTP_VERSION", info->http_version);
+  env.set("REQUEST_URI", info->request_uri); // get the full uri, we anyway handle abs uris later
+  env.set("SCRIPT_URI", info->local_uri);
   if (info->query_string) {
     env.set("QUERY_STRING", info->query_string);
   }
@@ -110,16 +146,15 @@ void RGWCivetWeb::init_env(CephContext *cct)
     env.set("REMOTE_USER", info->remote_user);
   }
 
+  if (port <= 0)
+    lderr(cct) << "init_env: bug: invalid port number" << dendl;
   char port_buf[16];
   snprintf(port_buf, sizeof(port_buf), "%d", port);
   env.set("SERVER_PORT", port_buf);
-
   if (info->is_ssl) {
-    if (port == 0) {
-      strcpy(port_buf,"443");
-    }
     env.set("SERVER_PORT_SECURE", port_buf);
   }
+  return 0;
 }
 
 size_t RGWCivetWeb::send_status(int status, const char *status_name)

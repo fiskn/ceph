@@ -8,22 +8,25 @@ import os
 from StringIO import StringIO
 from teuthology.orchestra import run
 from teuthology.orchestra.run import CommandFailedError, ConnectionLostError
+from tasks.cephfs.filesystem import Filesystem
 
 log = logging.getLogger(__name__)
 
 
 class CephFSMount(object):
-    def __init__(self, test_dir, client_id, client_remote):
+    def __init__(self, ctx, test_dir, client_id, client_remote):
         """
         :param test_dir: Global teuthology test dir
         :param client_id: Client ID, the 'foo' in client.foo
         :param client_remote: Remote instance for the host where client will run
         """
 
+        self.ctx = ctx
         self.test_dir = test_dir
         self.client_id = client_id
         self.client_remote = client_remote
         self.mountpoint_dir_name = 'mnt.{id}'.format(id=self.client_id)
+        self.fs = None
 
         self.test_files = ['a', 'b', 'c']
 
@@ -36,6 +39,15 @@ class CephFSMount(object):
 
     def is_mounted(self):
         raise NotImplementedError()
+
+    def setupfs(self, name=None):
+        if name is None and self.fs is not None:
+            # Previous mount existed, reuse the old name
+            name = self.fs.name
+        self.fs = Filesystem(self.ctx, name=name)
+        log.info('Wait for MDS to reach steady state...')
+        self.fs.wait_for_daemons()
+        log.info('Ready to start {}...'.format(type(self).__name__))
 
     def mount(self, mount_path=None, mount_fs_name=None):
         raise NotImplementedError()
@@ -91,6 +103,14 @@ class CephFSMount(object):
         finally:
             self.umount_wait()
 
+    def is_blacklisted(self):
+        addr = self.get_global_addr()
+        blacklist = json.loads(self.fs.mon_manager.raw_cluster_cmd("osd", "blacklist", "ls", "--format=json"))
+        for b in blacklist:
+            if addr == b["addr"]:
+                return True
+        return False
+
     def create_files(self):
         assert(self.is_mounted())
 
@@ -124,19 +144,21 @@ class CephFSMount(object):
             'sudo', 'rm', '-f', os.path.join(self.mountpoint, filename)
         ])
 
-    def _run_python(self, pyscript):
-        return self.client_remote.run(args=[
-            'sudo', 'adjust-ulimits', 'daemon-helper', 'kill', 'python', '-c', pyscript
-        ], wait=False, stdin=run.PIPE, stdout=StringIO())
+    def _run_python(self, pyscript, py_version='python'):
+        return self.client_remote.run(
+               args=['sudo', 'adjust-ulimits', 'daemon-helper', 'kill',
+                     py_version, '-c', pyscript], wait=False, stdin=run.PIPE,
+               stdout=StringIO())
 
-    def run_python(self, pyscript):
-        p = self._run_python(pyscript)
+    def run_python(self, pyscript, py_version='python'):
+        p = self._run_python(pyscript, py_version)
         p.wait()
         return p.stdout.getvalue().strip()
 
     def run_shell(self, args, wait=True):
         args = ["cd", self.mountpoint, run.Raw('&&'), "sudo"] + args
-        return self.client_remote.run(args=args, stdout=StringIO(), wait=wait)
+        return self.client_remote.run(args=args, stdout=StringIO(),
+                                      stderr=StringIO(), wait=wait)
 
     def open_no_data(self, basename):
         """
@@ -156,7 +178,10 @@ class CephFSMount(object):
     def open_background(self, basename="background_file"):
         """
         Open a file for writing, then block such that the client
-        will hold a capability
+        will hold a capability.
+
+        Don't return until the remote process has got as far as opening
+        the file, then return the RemoteProcess instance.
         """
         assert(self.is_mounted())
 
@@ -175,6 +200,12 @@ class CephFSMount(object):
 
         rproc = self._run_python(pyscript)
         self.background_procs.append(rproc)
+
+        # This wait would not be sufficient if the file had already
+        # existed, but it's simple and in practice users of open_background
+        # are not using it on existing files.
+        self.wait_for_visible(basename)
+
         return rproc
 
     def wait_for_visible(self, basename="background_file", timeout=30):
@@ -220,10 +251,30 @@ class CephFSMount(object):
 
         pyscript = dedent(script_builder).format(path=path)
 
-        log.info("lock file {0}".format(basename))
+        log.info("lock_background file {0}".format(basename))
         rproc = self._run_python(pyscript)
         self.background_procs.append(rproc)
         return rproc
+
+    def lock_and_release(self, basename="background_file"):
+        assert(self.is_mounted())
+
+        path = os.path.join(self.mountpoint, basename)
+
+        script = """
+            import time
+            import fcntl
+            import struct
+            f1 = open("{path}-1", 'w')
+            fcntl.flock(f1, fcntl.LOCK_EX)
+            f2 = open("{path}-2", 'w')
+            lockdata = struct.pack('hhllhh', fcntl.F_WRLCK, 0, 0, 0, 0, 0)
+            fcntl.fcntl(f2, fcntl.F_SETLK, lockdata)
+            """
+        pyscript = dedent(script).format(path=path)
+
+        log.info("lock_and_release file {0}".format(basename))
+        return self._run_python(pyscript)
 
     def check_filelock(self, basename="background_file", do_flock=True):
         assert(self.is_mounted())
@@ -426,37 +477,13 @@ class CephFSMount(object):
         self._kill_background(p)
         self.background_procs.remove(p)
 
-    def spam_dir_background(self, path):
-        """
-        Create directory `path` and do lots of metadata operations
-        in it until further notice.
-        """
-        assert(self.is_mounted())
-        abs_path = os.path.join(self.mountpoint, path)
-
-        pyscript = dedent("""
-            import sys
-            import time
-            import os
-
-            abs_path = "{abs_path}"
-
-            if not os.path.exists(abs_path):
-                os.makedirs(abs_path)
-
-            n = 0
-            while True:
-                file_path = os.path.join(abs_path, "tmp%d" % n)
-                f = open(file_path, 'w')
-                f.close()
-                n = n + 1
-            """).format(abs_path=abs_path)
-
-        rproc = self._run_python(pyscript)
-        self.background_procs.append(rproc)
-        return rproc
-
     def get_global_id(self):
+        raise NotImplementedError()
+
+    def get_global_inst(self):
+        raise NotImplementedError()
+
+    def get_global_addr(self):
         raise NotImplementedError()
 
     def get_osd_epoch(self):
@@ -581,13 +608,33 @@ class CephFSMount(object):
             # gives you [''] instead of []
             return []
 
+    def setfattr(self, path, key, val):
+        """
+        Wrap setfattr.
+
+        :param path: relative to mount point
+        :param key: xattr name
+        :param val: xattr value
+        :return: None
+        """
+        self.run_shell(["setfattr", "-n", key, "-v", val, path])
+
     def getfattr(self, path, attr):
         """
-        Wrap getfattr: return the values of a named xattr on one file.
+        Wrap getfattr: return the values of a named xattr on one file, or
+        None if the attribute is not found.
 
         :return: a string
         """
-        p = self.run_shell(["getfattr", "--only-values", "-n", attr, path])
+        p = self.run_shell(["getfattr", "--only-values", "-n", attr, path], wait=False)
+        try:
+            p.wait()
+        except CommandFailedError as e:
+            if e.exitstatus == 1 and "No such attribute" in p.stderr.getvalue():
+                return None
+            else:
+                raise
+
         return p.stdout.getvalue()
 
     def df(self):

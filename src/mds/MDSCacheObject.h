@@ -1,18 +1,18 @@
 #ifndef CEPH_MDSCACHEOBJECT_H
 #define CEPH_MDSCACHEOBJECT_H
 
-#include <set>
-#include <map>
 #include <ostream>
-using namespace std;
-
 
 #include "common/config.h"
-#include "include/assert.h"
+
+#include "include/Context.h"
+#include "include/ceph_assert.h"
+#include "include/mempool.h"
 #include "include/types.h"
 #include "include/xlist.h"
-#include "include/Context.h"
+
 #include "mdstypes.h"
+#include "MDSContext.h"
 
 #define MDS_REF_SET      // define me for improved debug output, sanity checking
 //#define MDS_AUTHPIN_SET  // define me for debugging auth pin leaks
@@ -31,15 +31,16 @@ struct ClientLease {
   client_t client;
   MDSCacheObject *parent;
 
-  ceph_seq_t seq;
+  ceph_seq_t seq = 0;
   utime_t ttl;
   xlist<ClientLease*>::item item_session_lease; // per-session list
   xlist<ClientLease*>::item item_lease;         // global list
 
   ClientLease(client_t c, MDSCacheObject *p) : 
-    client(c), parent(p), seq(0),
+    client(c), parent(p),
     item_session_lease(this),
     item_lease(this) { }
+  ClientLease() = delete;
 };
 
 
@@ -48,10 +49,10 @@ struct mdsco_db_line_prefix {
   MDSCacheObject *object;
   explicit mdsco_db_line_prefix(MDSCacheObject *o) : object(o) {}
 };
-std::ostream& operator<<(std::ostream& out, mdsco_db_line_prefix o);
+std::ostream& operator<<(std::ostream& out, const mdsco_db_line_prefix& o);
 
 // printer
-std::ostream& operator<<(std::ostream& out, MDSCacheObject &o);
+std::ostream& operator<<(std::ostream& out, const MDSCacheObject &o);
 
 class MDSCacheObject {
  public:
@@ -66,6 +67,7 @@ class MDSCacheObject {
   static const int PIN_PTRWAITER  = -1007;
   const static int PIN_TEMPEXPORTING = 1008;  // temp pin between encode_ and finish_export
   static const int PIN_CLIENTLEASE = 1009;
+  static const int PIN_DISCOVERBASE = 1010;
 
   const char *generic_pin_name(int p) const {
     switch (p) {
@@ -79,6 +81,7 @@ class MDSCacheObject {
     case PIN_PTRWAITER: return "ptrwaiter";
     case PIN_TEMPEXPORTING: return "tempexporting";
     case PIN_CLIENTLEASE: return "clientlease";
+    case PIN_DISCOVERBASE: return "discoverbase";
     default: ceph_abort(); return 0;
     }
   }
@@ -100,12 +103,7 @@ class MDSCacheObject {
   // ============================================
   // cons
  public:
-  MDSCacheObject() :
-    state(0), 
-    ref(0),
-    auth_pins(0), nested_auth_pins(0),
-    replica_nonce(0)
-  {}
+  MDSCacheObject() {}
   virtual ~MDSCacheObject() {}
 
   // printing
@@ -117,7 +115,7 @@ class MDSCacheObject {
   // --------------------------------------------
   // state
  protected:
-  __u32 state;     // state bits
+  __u32 state = 0;     // state bits
 
  public:
   unsigned get_state() const { return state; }
@@ -141,9 +139,9 @@ class MDSCacheObject {
   // --------------------------------------------
   // pins
 protected:
-  __s32      ref;       // reference count
+  __s32      ref = 0;       // reference count
 #ifdef MDS_REF_SET
-  std::map<int,int> ref_map;
+  mempool::mds_co::flat_map<int,int> ref_map;
 #endif
 
  public:
@@ -166,9 +164,9 @@ protected:
   virtual void last_put() {}
   virtual void bad_put(int by) {
 #ifdef MDS_REF_SET
-    assert(ref_map[by] > 0);
+    ceph_assert(ref_map[by] > 0);
 #endif
-    assert(ref > 0);
+    ceph_assert(ref > 0);
   }
   virtual void _put() {}
   void put(int by) {
@@ -193,7 +191,7 @@ protected:
   virtual void first_get() {}
   virtual void bad_get(int by) {
 #ifdef MDS_REF_SET
-    assert(by < 0 || ref_map[by] == 0);
+    ceph_assert(by < 0 || ref_map[by] == 0);
 #endif
     ceph_abort();
   }
@@ -210,10 +208,8 @@ protected:
 
   void print_pin_set(std::ostream& out) const {
 #ifdef MDS_REF_SET
-    std::map<int, int>::const_iterator it = ref_map.begin();
-    while (it != ref_map.end()) {
-      out << " " << pin_name(it->first) << "=" << it->second;
-      ++it;
+    for(auto const &p : ref_map) {
+      out << " " << pin_name(p.first) << "=" << p.second;
     }
 #else
     out << " nref=" << ref;
@@ -221,23 +217,35 @@ protected:
   }
 
   protected:
-  int auth_pins;
-  int nested_auth_pins;
+  int auth_pins = 0;
+  int nested_auth_pins = 0;
 #ifdef MDS_AUTHPIN_SET
-  multiset<void*> auth_pin_set;
+  mempool::mds_co::multiset<void*> auth_pin_set;
 #endif
 
   public:
   bool is_auth_pinned() const { return auth_pins || nested_auth_pins; }
   int get_num_auth_pins() const { return auth_pins; }
   int get_num_nested_auth_pins() const { return nested_auth_pins; }
+#ifdef MDS_AUTHPIN_SET
+  void print_authpin_set(std::ostream& out) const {
+    out << " (" << auth_pin_set << ")";
+  }
+#endif
 
   void dump_states(Formatter *f) const;
   void dump(Formatter *f) const;
 
   // --------------------------------------------
   // auth pins
-  virtual bool can_auth_pin() const = 0;
+  enum {
+    // can_auth_pin() error codes
+    ERR_NOT_AUTH = 1,
+    ERR_EXPORTING_TREE,
+    ERR_FRAGMENTING_DIR,
+    ERR_EXPORTING_INODE,
+  };
+  virtual bool can_auth_pin(int *err_code=nullptr) const = 0;
   virtual void auth_pin(void *who) = 0;
   virtual void auth_unpin(void *who) = 0;
   virtual bool is_frozen() const = 0;
@@ -250,48 +258,48 @@ protected:
   // --------------------------------------------
   // replication (across mds cluster)
  protected:
-  unsigned		replica_nonce; // [replica] defined on replica
-  compact_map<mds_rank_t,unsigned>	replica_map;   // [auth] mds -> nonce
+  unsigned		replica_nonce = 0; // [replica] defined on replica
+  typedef mempool::mds_co::compact_map<mds_rank_t,unsigned> replica_map_type;
+  replica_map_type replica_map;   // [auth] mds -> nonce
 
  public:
-  bool is_replicated() const { return !replica_map.empty(); }
-  bool is_replica(mds_rank_t mds) const { return replica_map.count(mds); }
-  int num_replicas() const { return replica_map.size(); }
+  bool is_replicated() const { return !get_replicas().empty(); }
+  bool is_replica(mds_rank_t mds) const { return get_replicas().count(mds); }
+  int num_replicas() const { return get_replicas().size(); }
   unsigned add_replica(mds_rank_t mds) {
-    if (replica_map.count(mds)) 
-      return ++replica_map[mds];  // inc nonce
-    if (replica_map.empty()) 
+    if (get_replicas().count(mds))
+      return ++get_replicas()[mds];  // inc nonce
+    if (get_replicas().empty())
       get(PIN_REPLICATED);
-    return replica_map[mds] = 1;
+    return get_replicas()[mds] = 1;
   }
   void add_replica(mds_rank_t mds, unsigned nonce) {
-    if (replica_map.empty()) 
+    if (get_replicas().empty())
       get(PIN_REPLICATED);
-    replica_map[mds] = nonce;
+    get_replicas()[mds] = nonce;
   }
   unsigned get_replica_nonce(mds_rank_t mds) {
-    assert(replica_map.count(mds));
-    return replica_map[mds];
+    ceph_assert(get_replicas().count(mds));
+    return get_replicas()[mds];
   }
   void remove_replica(mds_rank_t mds) {
-    assert(replica_map.count(mds));
-    replica_map.erase(mds);
-    if (replica_map.empty())
+    ceph_assert(get_replicas().count(mds));
+    get_replicas().erase(mds);
+    if (get_replicas().empty()) {
       put(PIN_REPLICATED);
+    }
   }
   void clear_replica_map() {
-    if (!replica_map.empty())
+    if (!get_replicas().empty())
       put(PIN_REPLICATED);
     replica_map.clear();
   }
-  compact_map<mds_rank_t,unsigned>::iterator replicas_begin() { return replica_map.begin(); }
-  compact_map<mds_rank_t,unsigned>::iterator replicas_end() { return replica_map.end(); }
-  const compact_map<mds_rank_t,unsigned>& get_replicas() const { return replica_map; }
+  replica_map_type& get_replicas() { return replica_map; }
+  const replica_map_type& get_replicas() const { return replica_map; }
   void list_replicas(std::set<mds_rank_t>& ls) const {
-    for (compact_map<mds_rank_t,unsigned>::const_iterator p = replica_map.begin();
-	 p != replica_map.end();
-	 ++p)
-      ls.insert(p->first);
+    for (const auto &p : get_replicas()) {
+      ls.insert(p.first);
+    }
   }
 
   unsigned get_replica_nonce() const { return replica_nonce; }
@@ -300,8 +308,8 @@ protected:
 
   // ---------------------------------------------
   // waiting
- protected:
-  compact_multimap<uint64_t, pair<uint64_t, MDSInternalContextBase*> > waiting;
+ private:
+  mempool::mds_co::compact_multimap<uint64_t, std::pair<uint64_t, MDSInternalContextBase*>> waiting;
   static uint64_t last_wait_seq;
 
  public:
@@ -309,11 +317,9 @@ protected:
     if (!min) {
       min = mask;
       while (min & (min-1))  // if more than one bit is set
-	min &= min-1;        //  clear LSB
+        min &= min-1;        //  clear LSB
     }
-    for (auto p = waiting.lower_bound(min);
-	 p != waiting.end();
-	 ++p) {
+    for (auto p = waiting.lower_bound(min); p != waiting.end(); ++p) {
       if (p->first & mask) return true;
       if (p->first > mask) return false;
     }
@@ -331,47 +337,46 @@ protected:
     waiting.insert(pair<uint64_t, pair<uint64_t, MDSInternalContextBase*> >(
 			    mask,
 			    pair<uint64_t, MDSInternalContextBase*>(seq, c)));
-//    pdout(10,g_conf->debug_mds) << (mdsco_db_line_prefix(this)) 
+//    pdout(10,g_conf()->debug_mds) << (mdsco_db_line_prefix(this)) 
 //			       << "add_waiter " << hex << mask << dec << " " << c
 //			       << " on " << *this
 //			       << dendl;
     
   }
-  virtual void take_waiting(uint64_t mask, list<MDSInternalContextBase*>& ls) {
+  virtual void take_waiting(uint64_t mask, MDSInternalContextBase::vec& ls) {
     if (waiting.empty()) return;
 
     // process ordered waiters in the same order that they were added.
     std::map<uint64_t, MDSInternalContextBase*> ordered_waiters;
 
-    for (auto it = waiting.begin();
-	 it != waiting.end(); ) {
+    for (auto it = waiting.begin(); it != waiting.end(); ) {
       if (it->first & mask) {
-
-	if (it->second.first > 0)
-	  ordered_waiters.insert(it->second);
-	else
-	  ls.push_back(it->second.second);
-//	pdout(10,g_conf->debug_mds) << (mdsco_db_line_prefix(this))
+	    if (it->second.first > 0) {
+	      ordered_waiters.insert(it->second);
+	    } else {
+	      ls.push_back(it->second.second);
+        }
+//	pdout(10,g_conf()->debug_mds) << (mdsco_db_line_prefix(this))
 //				   << "take_waiting mask " << hex << mask << dec << " took " << it->second
 //				   << " tag " << hex << it->first << dec
 //				   << " on " << *this
 //				   << dendl;
-	waiting.erase(it++);
+        waiting.erase(it++);
       } else {
-//	pdout(10,g_conf->debug_mds) << "take_waiting mask " << hex << mask << dec << " SKIPPING " << it->second
+//	pdout(10,g_conf()->debug_mds) << "take_waiting mask " << hex << mask << dec << " SKIPPING " << it->second
 //				   << " tag " << hex << it->first << dec
 //				   << " on " << *this 
 //				   << dendl;
-	++it;
+	      ++it;
       }
     }
-    for (auto it = ordered_waiters.begin();
-	 it != ordered_waiters.end();
-	 ++it) {
+    for (auto it = ordered_waiters.begin(); it != ordered_waiters.end(); ++it) {
       ls.push_back(it->second);
     }
-    if (waiting.empty())
+    if (waiting.empty()) {
       put(PIN_WAITER);
+      waiting.clear();
+    }
   }
   void finish_waiting(uint64_t mask, int result = 0);
 
@@ -381,7 +386,7 @@ protected:
   virtual SimpleLock* get_lock(int type) { ceph_abort(); return 0; }
   virtual void set_object_info(MDSCacheObjectInfo &info) { ceph_abort(); }
   virtual void encode_lock_state(int type, bufferlist& bl) { ceph_abort(); }
-  virtual void decode_lock_state(int type, bufferlist& bl) { ceph_abort(); }
+  virtual void decode_lock_state(int type, const bufferlist& bl) { ceph_abort(); }
   virtual void finish_lock_waiters(int type, uint64_t mask, int r=0) { ceph_abort(); }
   virtual void add_lock_waiter(int type, uint64_t mask, MDSInternalContextBase *c) { ceph_abort(); }
   virtual bool is_lock_waiting(int type, uint64_t mask) { ceph_abort(); return false; }
@@ -404,7 +409,7 @@ inline std::ostream& operator<<(std::ostream& out, MDSCacheObject &o) {
   return out;
 }
 
-inline std::ostream& operator<<(std::ostream& out, mdsco_db_line_prefix o) {
+inline std::ostream& operator<<(std::ostream& out, const mdsco_db_line_prefix& o) {
   o.object->print_db_line_prefix(out);
   return out;
 }

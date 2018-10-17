@@ -64,13 +64,13 @@ namespace librados {
     }
     void get() {
       lock.Lock();
-      assert(ref > 0);
+      ceph_assert(ref > 0);
       ref++;
       lock.Unlock();
     }
     void release() {
       lock.Lock();
-      assert(!released);
+      ceph_assert(!released);
       released = true;
       put_unlock();
     }
@@ -79,7 +79,7 @@ namespace librados {
       put_unlock();
     }
     void put_unlock() {
-      assert(ref > 0);
+      ceph_assert(ref > 0);
       int n = --ref;
       lock.Unlock();
       if (!n)
@@ -94,11 +94,11 @@ namespace librados {
     explicit C_PoolAsync_Safe(PoolAsyncCompletionImpl *_c) : c(_c) {
       c->get();
     }
-    ~C_PoolAsync_Safe() {
+    ~C_PoolAsync_Safe() override {
       c->put();
     }
   
-    void finish(int r) {
+    void finish(int r) override {
       c->lock.Lock();
       c->rval = r;
       c->done = true;

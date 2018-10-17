@@ -30,9 +30,9 @@
 #define dout_prefix *_dout << "xio."
 
 Mutex mtx("XioMessenger Package Lock");
-atomic_t initialized;
+std::atomic<bool> initialized = { false };
 
-atomic_t XioMessenger::nInstances;
+std::atomic<unsigned> XioMessenger::nInstances = { 0 };
 
 struct xio_mempool *xio_msgr_noreg_mpool;
 
@@ -52,8 +52,6 @@ static const level_pair LEVELS[] = {
   make_pair("trace", 20)
 };
 
-// maintain our own global context, we can't rely on g_ceph_context
-// for things like librados
 static CephContext *context;
 
 int get_level()
@@ -237,10 +235,10 @@ static string xio_uri_from_entity(const string &type,
 } /* xio_uri_from_entity */
 
 void XioInit::package_init(CephContext *cct) {
-   if (! initialized.read()) {
+   if (! initialized) {
 
      mtx.Lock();
-     if (! initialized.read()) {
+     if (! initialized) {
 
        xio_init();
 
@@ -336,7 +334,7 @@ void XioInit::package_init(CephContext *cct) {
        xio_msgr_ops.on_cancel_request = on_cancel_request;
 
        /* mark initialized */
-       initialized.set(1);
+       initialized = true;
      }
      mtx.Unlock();
    }
@@ -354,8 +352,6 @@ XioMessenger::XioMessenger(CephContext *cct, entity_name_t name,
 			   uint64_t cflags, DispatchStrategy *ds)
   : SimplePolicyMessenger(cct, name, mname, _nonce),
     XioInit(cct),
-    nsessions(0),
-    shutdown_called(false),
     portals(this, get_nportals(cflags), get_nconns_per_portal(cflags)),
     dispatch_strategy(ds),
     loop_con(new XioLoopbackConnection(this)),
@@ -376,12 +372,12 @@ XioMessenger::XioMessenger(CephContext *cct, entity_name_t name,
   dispatch_strategy->set_messenger(this);
 
   /* update class instance count */
-  nInstances.inc();
+  nInstances++;
 
   loop_con->set_features(CEPH_FEATURES_ALL);
 
   ldout(cct,2) << "Create msgr: " << this << " instance: "
-    << nInstances.read() << " type: " << name.type_str()
+    << nInstances << " type: " << name.type_str()
     << " subtype: " << mname << " nportals: " << get_nportals(cflags)
     << " nconns_per_portal: " << get_nconns_per_portal(cflags)
     << dendl;
@@ -449,13 +445,13 @@ int XioMessenger::new_session(struct xio_session *session,
 			      struct xio_new_session_req *req,
 			      void *cb_user_context)
 {
-  if (shutdown_called.read()) {
+  if (shutdown_called) {
     return xio_reject(
       session, XIO_E_SESSION_REFUSED, NULL /* udata */, 0 /* udata len */);
   }
   int code = portals.accept(session, req, cb_user_context);
   if (! code)
-    nsessions.inc();
+    nsessions++;
   return code;
 } /* new_session */
 
@@ -515,12 +511,12 @@ int XioMessenger::session_event(struct xio_session *session,
 
     xcon->conn = conn;
     xcon->portal = static_cast<XioPortal*>(xctxa.user_context);
-    assert(xcon->portal);
+    ceph_assert(xcon->portal);
 
     xcona.user_context = xcon;
     (void) xio_modify_connection(conn, &xcona, XIO_CONNECTION_ATTR_USER_CTX);
 
-    xcon->connected.set(true);
+    xcon->connected = true;
 
     /* sentinel ref */
     xcon->get(); /* xcon->nref == 1 */
@@ -568,9 +564,9 @@ int XioMessenger::session_event(struct xio_session *session,
       xp_stats.dump("xio session dtor", reinterpret_cast<uint64_t>(session));
     }
     xio_session_destroy(session);
-    if (nsessions.dec() == 0) {
+    if (--nsessions == 0) {
       Mutex::Locker lck(sh_mtx);
-      if (nsessions.read() == 0)
+      if (nsessions == 0)
 	sh_cond.Signal();
     }
     break;
@@ -773,7 +769,7 @@ static inline XioMsg* pool_alloc_xio_msg(Message *m, XioConnection *xcon,
   if (!!e)
     return NULL;
   XioMsg *xmsg = reinterpret_cast<XioMsg*>(mp_mem.addr);
-  assert(!!xmsg);
+  ceph_assert(!!xmsg);
   new (xmsg) XioMsg(m, xcon, mp_mem, ex_cnt, CEPH_FEATURES_ALL);
   return xmsg;
 }
@@ -785,7 +781,7 @@ XioCommand* pool_alloc_xio_command(XioConnection *xcon)
   if (!!e)
     return NULL;
   XioCommand *xcmd = reinterpret_cast<XioCommand*>(mp_mem.addr);
-  assert(!!xcmd);
+  ceph_assert(!!xcmd);
   new (xcmd) XioCommand(xcon, mp_mem);
   return xcmd;
 }
@@ -804,13 +800,12 @@ int XioMessenger::_send_message(Message *m, Connection *con)
 
   /* If con is not in READY state, we have to enforce policy */
   if (xcon->cstate.session_state.read() != XioConnection::UP) {
-    pthread_spin_lock(&xcon->sp);
+    std::lock_guard<decltype(xcon->sp) lg(xcon->sp);
+
     if (xcon->cstate.session_state.read() != XioConnection::UP) {
       xcon->outgoing.mqueue.push_back(*m);
-      pthread_spin_unlock(&xcon->sp);
       return 0;
     }
-    pthread_spin_unlock(&xcon->sp);
   }
 
   return _send_message_impl(m, xcon);
@@ -871,9 +866,9 @@ int XioMessenger::_send_message_impl(Message* m, XioConnection* xcon)
     switch (m->get_type()) {
     case 43:
     // case 15:
-      ldout(cct,4) << __func__ << "stop 43 " << m->get_type() << " " << *m << dendl;
+      ldout(cct,4) << __func__ << " stop 43 " << m->get_type() << " " << *m << dendl;
       buffer::list &payload = m->get_payload();
-      ldout(cct,4) << __func__ << "payload dump:" << dendl;
+      ldout(cct,4) << __func__ << " payload dump:" << dendl;
       payload.hexdump(cout);
     }
   }
@@ -917,7 +912,7 @@ int XioMessenger::_send_message_impl(Message* m, XioConnection* xcon)
   req = xmsg->get_xio_msg();
 
   const std::list<buffer::ptr>& header = xmsg->hdr.get_bl().buffers();
-  assert(header.size() == 1); /* XXX */
+  ceph_assert(header.size() == 1); /* XXX */
   list<bufferptr>::const_iterator pb = header.begin();
   req->out.header.iov_base = (char*) pb->c_str();
   req->out.header.iov_len = pb->length();
@@ -935,14 +930,17 @@ assert(req->out.pdata_iov.nents || !nbuffers);
      }
     tail->next = NULL;
   }
-  xcon->portal->enqueue(xcon, xmsg);
+  xmsg->trace = m->trace;
+  m->trace.event("xio portal enqueue for send");
+  m->trace.keyval("xio message segments", xmsg->hdr.msg_cnt);
+  xcon->portal->enqueue_for_send(xcon, xmsg);
 
   return code;
 } /* send_message(Message *, Connection *) */
 
 int XioMessenger::shutdown()
 {
-  shutdown_called.set(true);
+  shutdown_called = true;
   conns_sp.lock();
   XioConnection::ConnList::iterator iter;
   iter = conns_list.begin();
@@ -950,9 +948,9 @@ int XioMessenger::shutdown()
     (void) iter->disconnect(); // XXX mark down?
   }
   conns_sp.unlock();
-  while(nsessions.read() > 0) {
+  while(nsessions > 0) {
     Mutex::Locker lck(sh_mtx);
-    if (nsessions.read() > 0)
+    if (nsessions > 0)
       sh_cond.Wait(sh_mtx);
   }
   portals.shutdown();
@@ -964,7 +962,7 @@ int XioMessenger::shutdown()
 
 ConnectionRef XioMessenger::get_connection(const entity_inst_t& dest)
 {
-  if (shutdown_called.read())
+  if (shutdown_called)
     return NULL;
 
   const entity_inst_t& self_inst = get_myinst();
@@ -1019,8 +1017,8 @@ ConnectionRef XioMessenger::get_connection(const entity_inst_t& dest)
       return NULL;
     }
 
-    nsessions.inc();
-    xcon->connected.set(true);
+    nsessions++;
+    xcon->connected = true;
 
     /* sentinel ref */
     xcon->get(); /* xcon->nref == 1 */
@@ -1047,7 +1045,7 @@ ConnectionRef XioMessenger::get_loopback_connection()
 
 void XioMessenger::unregister_xcon(XioConnection *xcon)
 {
-  Spinlock::Locker lckr(conns_sp);
+  std::lock_guard<decltype(conns_sp)> lckr(conns_sp);
 
   XioConnection::EntitySet::iterator conn_iter =
 	conns_entity_map.find(xcon->peer, XioConnection::EntityComp());
@@ -1070,7 +1068,7 @@ void XioMessenger::unregister_xcon(XioConnection *xcon)
 void XioMessenger::mark_down(const entity_addr_t& addr)
 {
   entity_inst_t inst(entity_name_t(), addr);
-  Spinlock::Locker lckr(conns_sp);
+  std::lock_guard<decltype(conns_sp)> lckr(conns_sp);
   XioConnection::EntitySet::iterator conn_iter =
     conns_entity_map.find(inst, XioConnection::EntityComp());
   if (conn_iter != conns_entity_map.end()) {
@@ -1086,7 +1084,7 @@ void XioMessenger::mark_down(Connection* con)
 
 void XioMessenger::mark_down_all()
 {
-  Spinlock::Locker lckr(conns_sp);
+  std::lock_guard<decltype(conns_sp)> lckr(conns_sp);
   XioConnection::EntitySet::iterator conn_iter;
   for (conn_iter = conns_entity_map.begin(); conn_iter !=
 	 conns_entity_map.begin(); ++conn_iter) {
@@ -1114,7 +1112,7 @@ void XioMessenger::mark_down_on_empty(Connection* con)
   m->tag = XIO_NOP_TAG_MARKDOWN;
   m->set_completion_hook(pool_alloc_markdown_hook(xcon, m));
   // stall new messages
-  xcon->cstate.session_state.set(XioConnection::BARRIER);
+  xcon->cstate.session_state = XioConnection::session_states::BARRIER;
   (void) _send_message_impl(m, xcon);
 }
 
@@ -1126,7 +1124,7 @@ void XioMessenger::mark_disposable(Connection *con)
 
 void XioMessenger::try_insert(XioConnection *xcon)
 {
-  Spinlock::Locker lckr(conns_sp);
+  std::lock_guard<decltype(conns_sp)> lckr(conns_sp);
   /* already resident in conns_list */
   conns_entity_map.insert(*xcon);
 }
@@ -1134,5 +1132,5 @@ void XioMessenger::try_insert(XioConnection *xcon)
 XioMessenger::~XioMessenger()
 {
   delete dispatch_strategy;
-  nInstances.dec();
+  nInstances--;
 } /* dtor */

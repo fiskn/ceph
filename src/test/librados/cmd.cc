@@ -1,18 +1,14 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-#include "mds/mdstypes.h"
-#include "include/buffer.h"
-#include "include/rbd_types.h"
 #include "include/rados/librados.h"
 #include "include/rados/librados.hpp"
 #include "include/stringify.h"
 #include "test/librados/test.h"
 
-#include "common/Cond.h"
-
 #include "gtest/gtest.h"
 #include <errno.h>
+#include <condition_variable>
 #include <map>
 #include <sstream>
 #include <string>
@@ -116,9 +112,13 @@ TEST(LibRadosCmd, OSDCmd) {
   // note: tolerate NXIO here in case the cluster is thrashing out underneath us.
   cmd[0] = (char *)"asdfasdf";
   r = rados_osd_command(cluster, 0, (const char **)cmd, 1, "", 0, &buf, &buflen, &st, &stlen);
+  rados_buffer_free(buf);
+  rados_buffer_free(st);
   ASSERT_TRUE(r == -22 || r == -ENXIO);
   cmd[0] = (char *)"version";
   r = rados_osd_command(cluster, 0, (const char **)cmd, 1, "", 0, &buf, &buflen, &st, &stlen);
+  rados_buffer_free(buf);
+  rados_buffer_free(st);
   ASSERT_TRUE(r == -22 || r == -ENXIO);
   cmd[0] = (char *)"{\"prefix\":\"version\"}";
   r = rados_osd_command(cluster, 0, (const char **)cmd, 1, "", 0, &buf, &buflen, &st, &stlen);
@@ -168,6 +168,8 @@ TEST(LibRadosCmd, PGCmd) {
   // note: tolerate NXIO here in case the cluster is thrashing out underneath us.
   int r = rados_pg_command(cluster, pgid.c_str(), (const char **)cmd, 1, "", 0, &buf, &buflen, &st, &stlen);
   ASSERT_TRUE(r == -22 || r == -ENXIO);
+  rados_buffer_free(buf);
+  rados_buffer_free(st);
 
   // make sure the pg exists on the osd before we query it
   rados_ioctx_t io;
@@ -232,13 +234,11 @@ TEST(LibRadosCmd, PGCmdPP) {
 
 struct Log {
   list<string> log;
-  Cond cond;
-  Mutex lock;
+  std::condition_variable cond;
+  std::mutex lock;
 
-  Log() : lock("l::lock") {}
-
-  bool contains(string str) {
-    Mutex::Locker l(lock);
+  bool contains(const string& str) {
+    std::lock_guard<std::mutex> l(lock);
     for (list<string>::iterator p = log.begin(); p != log.end(); ++p) {
       if (p->find(str) != std::string::npos)
 	return true;
@@ -253,9 +253,9 @@ void log_cb(void *arg,
 	     uint64_t seq, const char *level,
 	     const char *msg) {
   Log *l = static_cast<Log *>(arg);
-  Mutex::Locker locker(l->lock);
+  std::lock_guard<std::mutex> locker(l->lock);
   l->log.push_back(line);
-  l->cond.Signal();
+  l->cond.notify_all();
   cout << "got: " << line << std::endl;
 }
 

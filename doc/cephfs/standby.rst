@@ -1,3 +1,4 @@
+.. _mds-standby:
 
 Terminology
 -----------
@@ -9,6 +10,8 @@ or *FSCID*.
 
 Each CephFS filesystem has a number of *ranks*, one by default,
 which start at zero.  A rank may be thought of as a metadata shard.
+Controlling the number of ranks in a filesystem is described
+in :doc:`/cephfs/multimds`
 
 Each CephFS ceph-mds process (a *daemon*) initially starts up
 without a rank.  It may be assigned one by the monitor cluster.
@@ -18,11 +21,6 @@ a rank when the ceph-mds process stops.
 If a rank is not associated with a daemon, the rank is
 considered *failed*.  Once a rank is assigned to a daemon,
 the rank is considered *up*.
-
-Each CephFS filesystem has a *max_mds* setting, which controls
-how many ranks will be created.  The actual number of ranks
-in the filesystem will only be increased if a spare daemon is
-available to take on the new rank.
 
 A daemon has a *name* that is set statically by the administrator
 when the daemon is first configured.  Typical configurations
@@ -64,6 +62,20 @@ If an MDS daemon stops communicating with the monitor, the monitor will
 wait ``mds_beacon_grace`` seconds (default 15 seconds) before marking
 the daemon as *laggy*.
 
+Each file system may specify a number of standby daemons to be considered
+healthy. This number includes daemons in standby-replay waiting for a rank to
+fail (remember that a standby-replay daemon will not be assigned to take over a
+failure for another rank or a failure in a another CephFS file system). The
+pool of standby daemons not in replay count towards any file system count.
+Each file system may set the number of standby daemons wanted using:
+
+::
+
+    ceph fs set <fs name> standby_count_wanted <count>
+
+Setting ``count`` to 0 will disable the health check.
+
+
 Configuring standby daemons
 ---------------------------
 
@@ -72,10 +84,10 @@ will behave while in standby:
 
 ::
 
+    mds_standby_replay
     mds_standby_for_name
     mds_standby_for_rank
     mds_standby_for_fscid
-    mds_standby_replay
 
 These may be set in the ceph.conf on the host where the MDS daemon
 runs (as opposed to on the monitor).  The daemon loads these settings
@@ -145,10 +157,10 @@ mon_force_standby_active
 
 This setting is used on monitor hosts.  It defaults to true.
 
-If it is false, then daemons configured with standby_replay=true
+If it is false, then daemons configured with mds_standby_replay=true
 will **only** become active if the rank/name that they have
 been configured to follow fails.  On the other hand, if this
-setting is true, then a daemon configured with standby_replay=true
+setting is true, then a daemon configured with mds_standby_replay=true
 may be assigned some other rank.
 
 Examples

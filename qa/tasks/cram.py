@@ -4,15 +4,18 @@ Cram tests
 import logging
 import os
 
+from util.workunit import get_refspec_after_overrides
+
 from teuthology import misc as teuthology
 from teuthology.parallel import parallel
 from teuthology.orchestra import run
+from teuthology.config import config as teuth_config
 
 log = logging.getLogger(__name__)
 
 def task(ctx, config):
     """
-    Run all cram tests from the specified urls on the specified
+    Run all cram tests from the specified paths on the specified
     clients. Each client runs tests in parallel.
 
     Limitations:
@@ -26,9 +29,9 @@ def task(ctx, config):
         - cram:
             clients:
               client.0:
-              - http://ceph.com/qa/test.t
-              - http://ceph.com/qa/test2.t]
-              client.1: [http://ceph.com/qa/test.t]
+              - qa/test.t
+              - qa/test2.t]
+              client.1: [qa/test.t]
             branch: foo
 
     You can also run a list of cram tests on all clients::
@@ -37,7 +40,7 @@ def task(ctx, config):
         - ceph:
         - cram:
             clients:
-              all: [http://ceph.com/qa/test.t]
+              all: [qa/test.t]
 
     :param ctx: Context
     :param config: Configuration
@@ -51,15 +54,10 @@ def task(ctx, config):
     testdir = teuthology.get_testdir(ctx)
 
     overrides = ctx.config.get('overrides', {})
-    teuthology.deep_merge(config, overrides.get('workunit', {}))
+    refspec = get_refspec_after_overrides(config, overrides)
 
-    refspec = config.get('branch')
-    if refspec is None:
-        refspec = config.get('tag')
-    if refspec is None:
-        refspec = config.get('sha1')
-    if refspec is None:
-        refspec = 'HEAD'
+    git_url = teuth_config.get_ceph_qa_suite_git_url()
+    log.info('Pulling tests from %s ref %s', git_url, refspec)
 
     try:
         for client, tests in clients.iteritems():
@@ -75,12 +73,14 @@ def task(ctx, config):
                     'install', 'cram==0.6',
                     ],
                 )
+            clone_dir = '{tdir}/clone.{role}'.format(tdir=testdir, role=client)
+            remote.run(args=refspec.clone(git_url, clone_dir))
+
             for test in tests:
-                log.info('fetching test %s for %s', test, client)
                 assert test.endswith('.t'), 'tests must end in .t'
                 remote.run(
                     args=[
-                        'wget', '-nc', '-nv', '-P', client_dir, '--', test.format(branch=refspec),
+                        'cp', '--', os.path.join(clone_dir, test), client_dir,
                         ],
                     )
 
@@ -111,6 +111,7 @@ def task(ctx, config):
                 args=[
                     'rm', '-rf', '--',
                     '{tdir}/virtualenv'.format(tdir=testdir),
+                    clone_dir,
                     run.Raw(';'),
                     'rmdir', '--ignore-fail-on-non-empty', client_dir,
                     ],
@@ -136,6 +137,7 @@ def _run_tests(ctx, role):
         args=[
             run.Raw('CEPH_REF={ref}'.format(ref=ceph_ref)),
             run.Raw('CEPH_ID="{id}"'.format(id=id_)),
+            run.Raw('PATH=$PATH:/usr/sbin'),
             'adjust-ulimits',
             'ceph-coverage',
             '{tdir}/archive/coverage'.format(tdir=testdir),

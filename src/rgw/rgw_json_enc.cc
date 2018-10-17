@@ -11,12 +11,14 @@
 #include "rgw_keystone.h"
 #include "rgw_basic_types.h"
 #include "rgw_op.h"
+#include "rgw_data_sync.h"
 #include "rgw_sync.h"
 #include "rgw_orphan.h"
 
 #include "common/ceph_json.h"
 #include "common/Formatter.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
 void encode_json(const char *name, const obj_version& v, Formatter *f)
@@ -38,6 +40,18 @@ void encode_json(const char *name, const RGWUserCaps& val, Formatter *f)
   val.dump(f, name);
 }
 
+
+void encode_json(const char *name, const rgw_pool& pool, Formatter *f)
+{
+  f->dump_string(name, pool.to_str());
+}
+
+void decode_json_obj(rgw_pool& pool, JSONObj *obj)
+{
+  string s;
+  decode_json_obj(s, obj);
+  pool = rgw_pool(s);
+}
 
 void RGWOLHInfo::dump(Formatter *f) const
 {
@@ -68,6 +82,32 @@ void RGWObjManifestRule::dump(Formatter *f) const
   encode_json("override_prefix", override_prefix, f);
 }
 
+void rgw_bucket_placement::dump(Formatter *f) const
+{
+  encode_json("bucket", bucket, f);
+  encode_json("placement_rule", placement_rule, f);
+}
+
+void rgw_obj_select::dump(Formatter *f) const
+{
+  f->dump_string("placement_rule", placement_rule);
+  f->dump_object("obj", obj);
+  f->dump_object("raw_obj", raw_obj);
+  f->dump_bool("is_raw", is_raw);
+}
+
+void RGWObjManifest::obj_iterator::dump(Formatter *f) const
+{
+  f->dump_unsigned("part_ofs", part_ofs);
+  f->dump_unsigned("stripe_ofs", stripe_ofs);
+  f->dump_unsigned("ofs", ofs);
+  f->dump_unsigned("stripe_size", stripe_size);
+  f->dump_int("cur_part_id", cur_part_id);
+  f->dump_int("cur_stripe", cur_stripe);
+  f->dump_string("cur_override_prefix", cur_override_prefix);
+  f->dump_object("location", location);
+}
+
 void RGWObjManifest::dump(Formatter *f) const
 {
   map<uint64_t, RGWObjManifestPart>::const_iterator iter = objs.begin();
@@ -81,13 +121,15 @@ void RGWObjManifest::dump(Formatter *f) const
   f->close_section();
   f->dump_unsigned("obj_size", obj_size);
   ::encode_json("explicit_objs", explicit_objs, f);
-  ::encode_json("head_obj", head_obj, f);
   ::encode_json("head_size", head_size, f);
   ::encode_json("max_head_size", max_head_size, f);
   ::encode_json("prefix", prefix, f);
-  ::encode_json("tail_bucket", tail_bucket, f);
   ::encode_json("rules", rules, f);
   ::encode_json("tail_instance", tail_instance, f);
+  ::encode_json("tail_placement", tail_placement, f);
+
+  f->dump_object("begin_iter", begin_iter);
+  f->dump_object("end_iter", end_iter);
 }
 
 void rgw_log_entry::dump(Formatter *f) const
@@ -181,6 +223,13 @@ void ACLOwner::dump(Formatter *f) const
 {
   encode_json("id", id.to_str(), f);
   encode_json("display_name", display_name, f);
+}
+
+void ACLOwner::decode_json(JSONObj *obj) {
+  string id_str;
+  JSONDecoder::decode_json("id", id_str, obj);
+  id.from_str(id_str);
+  JSONDecoder::decode_json("display_name", display_name, obj);
 }
 
 void RGWAccessControlPolicy::dump(Formatter *f) const
@@ -289,7 +338,7 @@ static struct rgw_flags_desc rgw_perms[] = {
  { RGW_PERM_READ, "read" },
  { RGW_PERM_WRITE, "write" },
  { RGW_PERM_READ_ACP, "read-acp" },
- { RGW_PERM_WRITE_ACP, "read-acp" },
+ { RGW_PERM_WRITE_ACP, "write-acp" },
  { 0, NULL }
 };
 
@@ -408,8 +457,6 @@ void RGWUserInfo::dump(Formatter *f) const
   encode_json("suspended", (int)suspended, f);
   encode_json("max_buckets", (int)max_buckets, f);
 
-  encode_json("auid", auid, f);
-
   encode_json_map("subusers", NULL, "subuser", NULL, user_info_dump_subuser,(void *)this, subusers, f);
   encode_json_map("keys", NULL, "key", NULL, user_info_dump_key,(void *)this, access_keys, f);
   encode_json_map("swift_keys", NULL, "key", NULL, user_info_dump_swift_key,(void *)this, swift_keys, f);
@@ -448,6 +495,7 @@ void RGWUserInfo::dump(Formatter *f) const
     break;
   }
   encode_json("type", user_source_type, f);
+  encode_json("mfa_ids", mfa_ids, f);
 }
 
 
@@ -485,7 +533,6 @@ void RGWUserInfo::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("suspended", susp, obj);
   suspended = (__u8)susp;
   JSONDecoder::decode_json("max_buckets", max_buckets, obj);
-  JSONDecoder::decode_json("auid", auid, obj);
 
   JSONDecoder::decode_json("keys", access_keys, decode_access_keys, obj);
   JSONDecoder::decode_json("swift_keys", swift_keys, decode_swift_keys, obj);
@@ -517,6 +564,7 @@ void RGWUserInfo::decode_json(JSONObj *obj)
   } else if (user_source_type == "none") {
     type = TYPE_NONE;
   }
+  JSONDecoder::decode_json("mfa_ids", mfa_ids, obj);
 }
 
 void RGWQuotaInfo::dump(Formatter *f) const
@@ -544,25 +592,40 @@ void RGWQuotaInfo::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("enabled", enabled, obj);
 }
 
+void rgw_data_placement_target::dump(Formatter *f) const
+{
+  encode_json("data_pool", data_pool, f);
+  encode_json("data_extra_pool", data_extra_pool, f);
+  encode_json("index_pool", index_pool, f);
+}
+  
+void rgw_data_placement_target::decode_json(JSONObj *obj) {
+  JSONDecoder::decode_json("data_pool", data_pool, obj);
+  JSONDecoder::decode_json("data_extra_pool", data_extra_pool, obj);
+  JSONDecoder::decode_json("index_pool", index_pool, obj);
+}
+
 void rgw_bucket::dump(Formatter *f) const
 {
   encode_json("name", name, f);
-  encode_json("pool", data_pool, f);
-  encode_json("data_extra_pool", data_extra_pool, f);
-  encode_json("index_pool", index_pool, f);
   encode_json("marker", marker, f);
   encode_json("bucket_id", bucket_id, f);
   encode_json("tenant", tenant, f);
+  encode_json("explicit_placement", explicit_placement, f);
 }
 
 void rgw_bucket::decode_json(JSONObj *obj) {
   JSONDecoder::decode_json("name", name, obj);
-  JSONDecoder::decode_json("pool", data_pool, obj);
-  JSONDecoder::decode_json("data_extra_pool", data_extra_pool, obj);
-  JSONDecoder::decode_json("index_pool", index_pool, obj);
   JSONDecoder::decode_json("marker", marker, obj);
   JSONDecoder::decode_json("bucket_id", bucket_id, obj);
   JSONDecoder::decode_json("tenant", tenant, obj);
+  JSONDecoder::decode_json("explicit_placement", explicit_placement, obj);
+  if (explicit_placement.data_pool.empty()) {
+    /* decoding old format */
+    JSONDecoder::decode_json("pool", explicit_placement.data_pool, obj);
+    JSONDecoder::decode_json("data_extra_pool", explicit_placement.data_extra_pool, obj);
+    JSONDecoder::decode_json("index_pool", explicit_placement.index_pool, obj);
+  }
 }
 
 void RGWBucketEntryPoint::dump(Formatter *f) const
@@ -665,12 +728,17 @@ void RGWBWRoutingRules::decode_json(JSONObj *obj) {
 
 void RGWBucketWebsiteConf::dump(Formatter *f) const
 {
-  encode_json("index_doc_suffix", index_doc_suffix, f);
-  encode_json("error_doc", error_doc, f);
-  encode_json("routing_rules", routing_rules, f);
+  if (!redirect_all.hostname.empty()) {
+    encode_json("redirect_all", redirect_all, f);
+  } else {
+    encode_json("index_doc_suffix", index_doc_suffix, f);
+    encode_json("error_doc", error_doc, f);
+    encode_json("routing_rules", routing_rules, f);
+  }
 }
 
 void RGWBucketWebsiteConf::decode_json(JSONObj *obj) {
+  JSONDecoder::decode_json("redirect_all", redirect_all, obj);
   JSONDecoder::decode_json("index_doc_suffix", index_doc_suffix, obj);
   JSONDecoder::decode_json("error_doc", error_doc, obj);
   JSONDecoder::decode_json("routing_rules", routing_rules, obj);
@@ -697,6 +765,9 @@ void RGWBucketInfo::dump(Formatter *f) const
   encode_json("swift_versioning", swift_versioning, f);
   encode_json("swift_ver_location", swift_ver_location, f);
   encode_json("index_type", (uint32_t)index_type, f);
+  encode_json("mdsearch_config", mdsearch_config, f);
+  encode_json("reshard_status", (int)reshard_status, f);
+  encode_json("new_bucket_instance_id", new_bucket_instance_id, f);
 }
 
 void RGWBucketInfo::decode_json(JSONObj *obj) {
@@ -728,28 +799,24 @@ void RGWBucketInfo::decode_json(JSONObj *obj) {
   uint32_t it;
   JSONDecoder::decode_json("index_type", it, obj);
   index_type = (RGWBucketIndexType)it;
+  JSONDecoder::decode_json("mdsearch_config", mdsearch_config, obj);
+  int rs;
+  JSONDecoder::decode_json("reshard_status", rs, obj);
+  reshard_status = (cls_rgw_reshard_status)rs;
 }
 
 void rgw_obj_key::dump(Formatter *f) const
 {
   encode_json("name", name, f);
   encode_json("instance", instance, f);
+  encode_json("ns", ns, f);
 }
 
-void RGWObjEnt::dump(Formatter *f) const
+void rgw_obj_key::decode_json(JSONObj *obj)
 {
-  encode_json("name", key.name, f);
-  encode_json("instance", key.instance, f);
-  encode_json("namespace", ns, f);
-  encode_json("owner", owner.to_str(), f);
-  encode_json("owner_display_name", owner_display_name, f);
-  encode_json("size", size, f);
-  utime_t ut(mtime);
-  encode_json("mtime", ut, f);
-  encode_json("etag", etag, f);
-  encode_json("content_type", content_type, f);
-  encode_json("tag", tag, f);
-  encode_json("flags", flags, f);
+  JSONDecoder::decode_json("name", name, obj);
+  JSONDecoder::decode_json("instance", instance, obj);
+  JSONDecoder::decode_json("ns", ns, obj);
 }
 
 void RGWBucketEnt::dump(Formatter *f) const
@@ -760,6 +827,7 @@ void RGWBucketEnt::dump(Formatter *f) const
   utime_t ut(creation_time);
   encode_json("mtime", ut, f); /* mtime / creation time discrepency needed for backward compatibility */
   encode_json("count", count, f);
+  encode_json("placement_rule", placement_rule, f);
 }
 
 void RGWUploadPartInfo::dump(Formatter *f) const
@@ -771,14 +839,23 @@ void RGWUploadPartInfo::dump(Formatter *f) const
   encode_json("modified", ut, f);
 }
 
+void rgw_raw_obj::dump(Formatter *f) const
+{
+  encode_json("pool", pool, f);
+  encode_json("oid", oid, f);
+  encode_json("loc", loc, f);
+}
+
+void rgw_raw_obj::decode_json(JSONObj *obj) {
+  JSONDecoder::decode_json("pool", pool, obj);
+  JSONDecoder::decode_json("oid", oid, obj);
+  JSONDecoder::decode_json("loc", loc, obj);
+}
+
 void rgw_obj::dump(Formatter *f) const
 {
   encode_json("bucket", bucket, f);
-  encode_json("key", loc, f);
-  encode_json("ns", ns, f);
-  encode_json("object", object, f);
-  encode_json("instance", instance, f);
-  encode_json("orig_obj", orig_obj, f);
+  encode_json("key", key, f);
 }
 
 void RGWDefaultSystemMetaObjInfo::dump(Formatter *f) const {
@@ -850,29 +927,24 @@ void RGWPeriod::decode_json(JSONObj *obj)
 void RGWZoneParams::dump(Formatter *f) const
 {
   RGWSystemMetaObj::dump(f);
-  encode_json("domain_root", domain_root.data_pool, f);
-  encode_json("control_pool", control_pool.data_pool, f);
-  encode_json("gc_pool", gc_pool.data_pool, f);
-  encode_json("lc_pool", lc_pool.data_pool, f);
-  encode_json("log_pool", log_pool.data_pool, f);
-  encode_json("intent_log_pool", intent_log_pool.data_pool, f);
-  encode_json("usage_log_pool", usage_log_pool.data_pool, f);
-  encode_json("user_keys_pool", user_keys_pool.data_pool, f);
-  encode_json("user_email_pool", user_email_pool.data_pool, f);
-  encode_json("user_swift_pool", user_swift_pool.data_pool, f);
-  encode_json("user_uid_pool", user_uid_pool.data_pool, f);
+  encode_json("domain_root", domain_root, f);
+  encode_json("control_pool", control_pool, f);
+  encode_json("gc_pool", gc_pool, f);
+  encode_json("lc_pool", lc_pool, f);
+  encode_json("log_pool", log_pool, f);
+  encode_json("intent_log_pool", intent_log_pool, f);
+  encode_json("usage_log_pool", usage_log_pool, f);
+  encode_json("reshard_pool", reshard_pool, f);
+  encode_json("user_keys_pool", user_keys_pool, f);
+  encode_json("user_email_pool", user_email_pool, f);
+  encode_json("user_swift_pool", user_swift_pool, f);
+  encode_json("user_uid_pool", user_uid_pool, f);
+  encode_json("otp_pool", otp_pool, f);
   encode_json_plain("system_key", system_key, f);
   encode_json("placement_pools", placement_pools, f);
-  encode_json("metadata_heap", metadata_heap.data_pool, f);
+  encode_json("metadata_heap", metadata_heap, f);
   encode_json("tier_config", tier_config, f);
   encode_json("realm_id", realm_id, f);
-}
-
-static void decode_json(const char *field, rgw_bucket& bucket, JSONObj *obj)
-{
-  string pool;
-  JSONDecoder::decode_json(field, pool, obj);
-  bucket = rgw_bucket(pool.c_str());
 }
 
 void RGWZonePlacementInfo::dump(Formatter *f) const
@@ -898,20 +970,22 @@ void RGWZonePlacementInfo::decode_json(JSONObj *obj)
 void RGWZoneParams::decode_json(JSONObj *obj)
 {
   RGWSystemMetaObj::decode_json(obj);
-  ::decode_json("domain_root", domain_root, obj);
-  ::decode_json("control_pool", control_pool, obj);
-  ::decode_json("gc_pool", gc_pool, obj);
-  ::decode_json("lc_pool", lc_pool, obj);
-  ::decode_json("log_pool", log_pool, obj);
-  ::decode_json("intent_log_pool", intent_log_pool, obj);
-  ::decode_json("usage_log_pool", usage_log_pool, obj);
-  ::decode_json("user_keys_pool", user_keys_pool, obj);
-  ::decode_json("user_email_pool", user_email_pool, obj);
-  ::decode_json("user_swift_pool", user_swift_pool, obj);
-  ::decode_json("user_uid_pool", user_uid_pool, obj);
+  JSONDecoder::decode_json("domain_root", domain_root, obj);
+  JSONDecoder::decode_json("control_pool", control_pool, obj);
+  JSONDecoder::decode_json("gc_pool", gc_pool, obj);
+  JSONDecoder::decode_json("lc_pool", lc_pool, obj);
+  JSONDecoder::decode_json("log_pool", log_pool, obj);
+  JSONDecoder::decode_json("intent_log_pool", intent_log_pool, obj);
+  JSONDecoder::decode_json("reshard_pool", reshard_pool, obj);
+  JSONDecoder::decode_json("usage_log_pool", usage_log_pool, obj);
+  JSONDecoder::decode_json("user_keys_pool", user_keys_pool, obj);
+  JSONDecoder::decode_json("user_email_pool", user_email_pool, obj);
+  JSONDecoder::decode_json("user_swift_pool", user_swift_pool, obj);
+  JSONDecoder::decode_json("user_uid_pool", user_uid_pool, obj);
+  JSONDecoder::decode_json("otp_pool", otp_pool, obj);
   JSONDecoder::decode_json("system_key", system_key, obj);
   JSONDecoder::decode_json("placement_pools", placement_pools, obj);
-  ::decode_json("metadata_heap", metadata_heap, obj);
+  JSONDecoder::decode_json("metadata_heap", metadata_heap, obj);
   JSONDecoder::decode_json("tier_config", tier_config, obj);
   JSONDecoder::decode_json("realm_id", realm_id, obj);
 
@@ -929,6 +1003,7 @@ void RGWZone::dump(Formatter *f) const
   encode_json("tier_type", tier_type, f);
   encode_json("sync_from_all", sync_from_all, f);
   encode_json("sync_from", sync_from, f);
+  encode_json("redirect_zone", redirect_zone, f);
 }
 
 void RGWZone::decode_json(JSONObj *obj)
@@ -944,8 +1019,9 @@ void RGWZone::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("bucket_index_max_shards", bucket_index_max_shards, obj);
   JSONDecoder::decode_json("read_only", read_only, obj);
   JSONDecoder::decode_json("tier_type", tier_type, obj);
-  JSONDecoder::decode_json("sync_from_all", sync_from_all, obj);
+  JSONDecoder::decode_json("sync_from_all", sync_from_all, true, obj);
   JSONDecoder::decode_json("sync_from", sync_from, obj);
+  JSONDecoder::decode_json("redirect_zone", redirect_zone, obj);
 }
 
 void RGWZoneGroupPlacementTarget::dump(Formatter *f) const
@@ -1140,7 +1216,7 @@ void RGWRealm::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("epoch", epoch, obj);
 }
 
-void KeystoneToken::Token::decode_json(JSONObj *obj)
+void rgw::keystone::TokenEnvelope::Token::decode_json(JSONObj *obj)
 {
   string expires_iso8601;
   struct tm t;
@@ -1150,33 +1226,33 @@ void KeystoneToken::Token::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("expires", expires_iso8601, obj, true);
 
   if (parse_iso8601(expires_iso8601.c_str(), &t)) {
-    expires = timegm(&t);
+    expires = internal_timegm(&t);
   } else {
     expires = 0;
     throw JSONDecoder::err("Failed to parse ISO8601 expiration date from Keystone response.");
   }
 }
 
-void KeystoneToken::Role::decode_json(JSONObj *obj)
+void rgw::keystone::TokenEnvelope::Role::decode_json(JSONObj *obj)
 {
   JSONDecoder::decode_json("id", id, obj);
   JSONDecoder::decode_json("name", name, obj, true);
 }
 
-void KeystoneToken::Domain::decode_json(JSONObj *obj)
+void rgw::keystone::TokenEnvelope::Domain::decode_json(JSONObj *obj)
 {
   JSONDecoder::decode_json("id", id, obj, true);
   JSONDecoder::decode_json("name", name, obj, true);
 }
 
-void KeystoneToken::Project::decode_json(JSONObj *obj)
+void rgw::keystone::TokenEnvelope::Project::decode_json(JSONObj *obj)
 {
   JSONDecoder::decode_json("id", id, obj, true);
   JSONDecoder::decode_json("name", name, obj, true);
   JSONDecoder::decode_json("domain", domain, obj);
 }
 
-void KeystoneToken::User::decode_json(JSONObj *obj)
+void rgw::keystone::TokenEnvelope::User::decode_json(JSONObj *obj)
 {
   JSONDecoder::decode_json("id", id, obj, true);
   JSONDecoder::decode_json("name", name, obj, true);
@@ -1184,57 +1260,32 @@ void KeystoneToken::User::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("roles", roles_v2, obj);
 }
 
-void KeystoneToken::decode_json(JSONObj *root_obj)
+void rgw::keystone::TokenEnvelope::decode_v3(JSONObj* const root_obj)
+{
+  std::string expires_iso8601;
+
+  JSONDecoder::decode_json("user", user, root_obj, true);
+  JSONDecoder::decode_json("expires_at", expires_iso8601, root_obj, true);
+  JSONDecoder::decode_json("roles", roles, root_obj, true);
+  JSONDecoder::decode_json("project", project, root_obj, true);
+
+  struct tm t;
+  if (parse_iso8601(expires_iso8601.c_str(), &t)) {
+    token.expires = internal_timegm(&t);
+  } else {
+    token.expires = 0;
+    throw JSONDecoder::err("Failed to parse ISO8601 expiration date"
+                           "from Keystone response.");
+  }
+}
+
+void rgw::keystone::TokenEnvelope::decode_v2(JSONObj* const root_obj)
 {
   JSONDecoder::decode_json("user", user, root_obj, true);
+  JSONDecoder::decode_json("token", token, root_obj, true);
 
-  const auto version = KeystoneService::get_api_version();
-
-  if (version == KeystoneApiVersion::VER_3) {
-    string expires_iso8601;
-    if (JSONDecoder::decode_json("expires_at", expires_iso8601, root_obj)) {
-      /* VER_3 */
-      /* Presence of "expires_at" suggests we are dealing with OpenStack
-       * Identity API v3 (aka Keystone API v3) token. */
-      struct tm t;
-
-      if (parse_iso8601(expires_iso8601.c_str(), &t)) {
-        token.expires = timegm(&t);
-      } else {
-        token.expires = 0;
-        throw JSONDecoder::err("Failed to parse ISO8601 expiration date"
-                               "from Keystone response.");
-      }
-      JSONDecoder::decode_json("roles", roles, root_obj, true);
-      JSONDecoder::decode_json("project", project, root_obj, true);
-    } else {
-      /* fallback: VER_2 */
-      JSONDecoder::decode_json("token", token, root_obj, true);
-      roles = user.roles_v2;
-      project = token.tenant_v2;
-    }
-  } else if (version == KeystoneApiVersion::VER_2) {
-    if (JSONDecoder::decode_json("token", token, root_obj)) {
-      /* VER_2 */
-      roles = user.roles_v2;
-      project = token.tenant_v2;
-    } else {
-      /* fallback: VER_3 */
-      string expires_iso8601;
-      JSONDecoder::decode_json("expires_at", expires_iso8601, root_obj, true);
-
-      struct tm t;
-      if (parse_iso8601(expires_iso8601.c_str(), &t)) {
-        token.expires = timegm(&t);
-      } else {
-        token.expires = 0;
-        throw JSONDecoder::err("Failed to parse ISO8601 expiration date"
-                               "from Keystone response.");
-      }
-      JSONDecoder::decode_json("roles", roles, root_obj, true);
-      JSONDecoder::decode_json("project", project, root_obj, true);
-    }
-  }
+  roles = user.roles_v2;
+  project = token.tenant_v2;
 }
 
 void rgw_slo_entry::decode_json(JSONObj *obj)
@@ -1295,6 +1346,7 @@ void rgw_meta_sync_marker::decode_json(JSONObj *obj)
   utime_t ut;
   JSONDecoder::decode_json("timestamp", ut, obj);
   timestamp = ut.to_real_time();
+  JSONDecoder::decode_json("realm_epoch", realm_epoch, obj);
 }
 
 void rgw_meta_sync_marker::dump(Formatter *f) const
@@ -1305,6 +1357,7 @@ void rgw_meta_sync_marker::dump(Formatter *f) const
   encode_json("total_entries", total_entries, f);
   encode_json("pos", pos, f);
   encode_json("timestamp", utime_t(timestamp), f);
+  encode_json("realm_epoch", realm_epoch, f);
 }
 
 void rgw_meta_sync_status::decode_json(JSONObj *obj)
@@ -1324,20 +1377,88 @@ void rgw_sync_error_info::dump(Formatter *f) const {
   encode_json("message", message, f);
 }
 
-void KeystoneAdminTokenRequestVer2::dump(Formatter * const f) const
+void rgw_bucket_shard_full_sync_marker::decode_json(JSONObj *obj)
+{
+  JSONDecoder::decode_json("position", position, obj);
+  JSONDecoder::decode_json("count", count, obj);
+}
+
+void rgw_bucket_shard_full_sync_marker::dump(Formatter *f) const
+{
+  encode_json("position", position, f);
+  encode_json("count", count, f);
+}
+
+void rgw_bucket_shard_inc_sync_marker::decode_json(JSONObj *obj)
+{
+  JSONDecoder::decode_json("position", position, obj);
+}
+
+void rgw_bucket_shard_inc_sync_marker::dump(Formatter *f) const
+{
+  encode_json("position", position, f);
+}
+
+void rgw_bucket_shard_sync_info::decode_json(JSONObj *obj)
+{
+  std::string s;
+  JSONDecoder::decode_json("status", s, obj);
+  if (s == "full-sync") {
+    state = StateFullSync;
+  } else if (s == "incremental-sync") {
+    state = StateIncrementalSync;
+  } else {
+    state = StateInit;
+  }
+  JSONDecoder::decode_json("full_marker", full_marker, obj);
+  JSONDecoder::decode_json("inc_marker", inc_marker, obj);
+}
+
+void rgw_bucket_shard_sync_info::dump(Formatter *f) const
+{
+  const char *s{nullptr};
+  switch ((SyncState)state) {
+    case StateInit:
+    s = "init";
+    break;
+  case StateFullSync:
+    s = "full-sync";
+    break;
+  case StateIncrementalSync:
+    s = "incremental-sync";
+    break;
+  default:
+    s = "unknown";
+    break;
+  }
+  encode_json("status", s, f);
+  encode_json("full_marker", full_marker, f);
+  encode_json("inc_marker", inc_marker, f);
+}
+
+/* This utility function shouldn't conflict with the overload of std::to_string
+ * provided by string_ref since Boost 1.54 as it's defined outside of the std
+ * namespace. I hope we'll remove it soon - just after merging the Matt's PR
+ * for bundled Boost. It would allow us to forget that CentOS 7 has Boost 1.53. */
+static inline std::string to_string(const boost::string_ref& s)
+{
+  return std::string(s.data(), s.length());
+}
+
+void rgw::keystone::AdminTokenRequestVer2::dump(Formatter* const f) const
 {
   f->open_object_section("token_request");
     f->open_object_section("auth");
       f->open_object_section("passwordCredentials");
-        encode_json("username", cct->_conf->rgw_keystone_admin_user, f);
-        encode_json("password", cct->_conf->rgw_keystone_admin_password, f);
+        encode_json("username", to_string(conf.get_admin_user()), f);
+        encode_json("password", to_string(conf.get_admin_password()), f);
       f->close_section();
-      encode_json("tenantName", cct->_conf->rgw_keystone_admin_tenant, f);
+      encode_json("tenantName", to_string(conf.get_admin_tenant()), f);
     f->close_section();
   f->close_section();
 }
 
-void KeystoneAdminTokenRequestVer3::dump(Formatter * const f) const
+void rgw::keystone::AdminTokenRequestVer3::dump(Formatter* const f) const
 {
   f->open_object_section("token_request");
     f->open_object_section("auth");
@@ -1348,22 +1469,22 @@ void KeystoneAdminTokenRequestVer3::dump(Formatter * const f) const
         f->open_object_section("password");
           f->open_object_section("user");
             f->open_object_section("domain");
-              encode_json("name", cct->_conf->rgw_keystone_admin_domain, f);
+              encode_json("name", to_string(conf.get_admin_domain()), f);
             f->close_section();
-            encode_json("name", cct->_conf->rgw_keystone_admin_user, f);
-            encode_json("password", cct->_conf->rgw_keystone_admin_password, f);
+            encode_json("name", to_string(conf.get_admin_user()), f);
+            encode_json("password", to_string(conf.get_admin_password()), f);
           f->close_section();
         f->close_section();
       f->close_section();
       f->open_object_section("scope");
         f->open_object_section("project");
-          if (!cct->_conf->rgw_keystone_admin_project.empty()) {
-            encode_json("name", cct->_conf->rgw_keystone_admin_project, f);
+          if (! conf.get_admin_project().empty()) {
+            encode_json("name", to_string(conf.get_admin_project()), f);
           } else {
-            encode_json("name", cct->_conf->rgw_keystone_admin_tenant, f);
+            encode_json("name", to_string(conf.get_admin_tenant()), f);
           }
           f->open_object_section("domain");
-            encode_json("name", cct->_conf->rgw_keystone_admin_domain, f);
+            encode_json("name", to_string(conf.get_admin_domain()), f);
           f->close_section();
         f->close_section();
       f->close_section();
@@ -1371,6 +1492,53 @@ void KeystoneAdminTokenRequestVer3::dump(Formatter * const f) const
   f->close_section();
 }
 
+
+void rgw::keystone::BarbicanTokenRequestVer2::dump(Formatter* const f) const
+{
+  f->open_object_section("token_request");
+    f->open_object_section("auth");
+      f->open_object_section("passwordCredentials");
+        encode_json("username", cct->_conf->rgw_keystone_barbican_user, f);
+        encode_json("password", cct->_conf->rgw_keystone_barbican_password, f);
+      f->close_section();
+      encode_json("tenantName", cct->_conf->rgw_keystone_barbican_tenant, f);
+    f->close_section();
+  f->close_section();
+}
+
+void rgw::keystone::BarbicanTokenRequestVer3::dump(Formatter* const f) const
+{
+  f->open_object_section("token_request");
+    f->open_object_section("auth");
+      f->open_object_section("identity");
+        f->open_array_section("methods");
+          f->dump_string("", "password");
+        f->close_section();
+        f->open_object_section("password");
+          f->open_object_section("user");
+            f->open_object_section("domain");
+              encode_json("name", cct->_conf->rgw_keystone_barbican_domain, f);
+            f->close_section();
+            encode_json("name", cct->_conf->rgw_keystone_barbican_user, f);
+            encode_json("password", cct->_conf->rgw_keystone_barbican_password, f);
+          f->close_section();
+        f->close_section();
+      f->close_section();
+      f->open_object_section("scope");
+        f->open_object_section("project");
+          if (!cct->_conf->rgw_keystone_barbican_project.empty()) {
+            encode_json("name", cct->_conf->rgw_keystone_barbican_project, f);
+          } else {
+            encode_json("name", cct->_conf->rgw_keystone_barbican_tenant, f);
+          }
+          f->open_object_section("domain");
+            encode_json("name", cct->_conf->rgw_keystone_barbican_domain, f);
+          f->close_section();
+        f->close_section();
+      f->close_section();
+    f->close_section();
+  f->close_section();
+}
 
 void RGWOrphanSearchStage::dump(Formatter *f) const
 {
@@ -1405,7 +1573,7 @@ void RGWOrphanSearchInfo::dump(Formatter *f) const
 {
   f->open_object_section("orphan_search_info");
   f->dump_string("job_name", job_name);
-  f->dump_string("pool", pool);
+  encode_json("pool", pool, f);
   f->dump_int("num_shards", num_shards);
   encode_json("start_time", start_time, f);
   f->close_section();
@@ -1417,4 +1585,89 @@ void RGWOrphanSearchState::dump(Formatter *f) const
   encode_json("info", info, f);
   encode_json("stage", stage, f);
   f->close_section();
+}
+
+void RGWObjTags::dump(Formatter *f) const
+{
+  for (auto& tag: tag_map){
+    f->open_object_section("tag_map");
+    f->dump_string("key", tag.first);
+    f->dump_string("value", tag.second);
+    f->close_section();
+  }
+}
+
+void lc_op::dump(Formatter *f) const
+{
+  f->dump_bool("status", status);
+  f->dump_bool("dm_expiration", dm_expiration);
+
+  f->dump_int("expiration", expiration);
+  f->dump_int("noncur_expiration", noncur_expiration);
+  f->dump_int("mp_expiration", mp_expiration);
+  if (expiration_date) {
+    utime_t ut(*expiration_date);
+    f->dump_stream("expiration_date") << ut;
+  }
+  if (obj_tags) {
+    f->dump_object("obj_tags", *obj_tags);
+  }
+}
+
+void LCFilter::dump(Formatter *f) const
+{
+  f->dump_string("prefix", prefix);
+  f->dump_object("obj_tags", obj_tags);
+}
+
+void LCExpiration::dump(Formatter *f) const
+{
+  f->dump_string("days", days);
+  f->dump_string("date", date);
+}
+
+void LCRule::dump(Formatter *f) const
+{
+  f->dump_string("id", id);
+  f->dump_string("prefix", prefix);
+  f->dump_string("status", status);
+  f->dump_object("expiration", expiration);
+  f->dump_object("noncur_expiration", noncur_expiration);
+  f->dump_object("mp_expiration", mp_expiration);
+  f->dump_object("filter", filter);
+  f->dump_bool("dm_expiration", dm_expiration);
+}
+
+void RGWLifecycleConfiguration::dump(Formatter *f) const
+{
+  f->open_object_section("prefix_map");
+  for (auto& prefix : prefix_map) {
+    f->dump_object(prefix.first.c_str(), prefix.second);
+  }
+  f->close_section();
+
+  f->open_array_section("rule_map");
+  for (auto& rule : rule_map) {
+    f->open_object_section("entry");
+    f->dump_string("id", rule.first);
+    f->open_object_section("rule");
+    rule.second.dump(f);
+    f->close_section();
+    f->close_section();
+  }
+  f->close_section();
+}
+
+void compression_block::dump(Formatter *f) const
+{
+  f->dump_unsigned("old_ofs", old_ofs);
+  f->dump_unsigned("new_ofs", new_ofs);
+  f->dump_unsigned("len", len);
+}
+
+void RGWCompressionInfo::dump(Formatter *f) const
+{
+  f->dump_string("compression_type", compression_type);
+  f->dump_unsigned("orig_size", orig_size);
+  ::encode_json("blocks", blocks, f);
 }

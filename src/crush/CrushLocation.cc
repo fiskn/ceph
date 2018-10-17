@@ -4,12 +4,14 @@
 #include "include/compat.h"
 #include "CrushLocation.h"
 #include "CrushWrapper.h"
+#include "common/ceph_context.h"
 #include "common/config.h"
 #include "include/str_list.h"
 #include "common/debug.h"
+#include "common/errno.h"
 #include "include/compat.h"
 
-#include <common/SubProcess.h>
+#include "common/SubProcess.h"
 
 #include <vector>
 
@@ -42,6 +44,12 @@ int CrushLocation::update_from_hook()
 {
   if (cct->_conf->crush_location_hook.length() == 0)
     return 0;
+ 
+  if (0 != access(cct->_conf->crush_location_hook.c_str(), R_OK)) {
+    lderr(cct) << "the user define crush location hook: " << cct->_conf->crush_location_hook
+               << " may not exist or can not access it" << dendl;
+    return errno;
+  }
 
   SubProcessTimed hook(
     cct->_conf->crush_location_hook.c_str(),
@@ -70,13 +78,15 @@ int CrushLocation::update_from_hook()
     lderr(cct) << "stderr:\n";
     err.hexdump(*_dout);
     *_dout << dendl;
-    return ret;
   }
 
   if (hook.join() != 0) {
     lderr(cct) << "error: failed to join: " << hook.err() << dendl;
     return -EINVAL;
   }
+
+  if (ret < 0)
+    return ret;
 
   std::string out;
   bl.copy(0, bl.length(), out);

@@ -18,8 +18,10 @@
 #define CEPH_CDENTRY_H
 
 #include <string>
+#include <string_view>
 #include <set>
 
+#include "include/counter.h"
 #include "include/types.h"
 #include "include/buffer_fwd.h"
 #include "include/lru.h"
@@ -27,6 +29,7 @@
 #include "include/filepath.h"
 
 #include "MDSCacheObject.h"
+#include "MDSContext.h"
 #include "SimpleLock.h"
 #include "LocalLock.h"
 #include "ScrubHeader.h"
@@ -34,7 +37,6 @@
 class CInode;
 class CDir;
 class Locker;
-class Message;
 class CDentry;
 class LogSegment;
 
@@ -46,16 +48,17 @@ class Session;
 bool operator<(const CDentry& l, const CDentry& r);
 
 // dentry
-class CDentry : public MDSCacheObject, public LRUObject {
+class CDentry : public MDSCacheObject, public LRUObject, public Counter<CDentry> {
 public:
+  MEMPOOL_CLASS_HELPERS();
   friend class CDir;
 
   struct linkage_t {
-    CInode *inode;
-    inodeno_t remote_ino;
-    unsigned char remote_d_type;
+    CInode *inode = nullptr;
+    inodeno_t remote_ino = 0;
+    unsigned char remote_d_type = 0;
     
-    linkage_t() : inode(0), remote_ino(0), remote_d_type(0) {}
+    linkage_t() {}
 
     // dentry type is primary || remote || null
     // inode ptr is required for primary, optional for remote, undefined for null
@@ -85,8 +88,10 @@ public:
   static const int STATE_BADREMOTEINO = (1<<3);
   static const int STATE_EVALUATINGSTRAY = (1<<4);
   static const int STATE_PURGINGPINNED =  (1<<5);
+  static const int STATE_BOTTOMLRU =    (1<<6);
   // stray dentry needs notification of releasing reference
   static const int STATE_STRAY =	STATE_NOTIFYREF;
+  static const int MASK_STATE_IMPORT_KEPT = STATE_BOTTOMLRU;
 
   // -- pins --
   static const int PIN_INODEPIN =     1;  // linked inode is pinned
@@ -97,49 +102,29 @@ public:
   static const unsigned EXPORT_NONCE = 1;
 
 
-  CDentry(const std::string& n, __u32 h,
+  CDentry(std::string_view n, __u32 h,
 	  snapid_t f, snapid_t l) :
-    name(n), hash(h),
+    hash(h),
     first(f), last(l),
     item_dirty(this),
     lock(this, &lock_type),
     versionlock(this, &versionlock_type),
-    dir(0),
-    version(0), projected_version(0) {
-    g_num_dn++;
-    g_num_dna++;
-  }
-  CDentry(const std::string& n, __u32 h, inodeno_t ino, unsigned char dt,
+    name(n)
+  {}
+  CDentry(std::string_view n, __u32 h, inodeno_t ino, unsigned char dt,
 	  snapid_t f, snapid_t l) :
-    name(n), hash(h),
+    hash(h),
     first(f), last(l),
     item_dirty(this),
     lock(this, &lock_type),
     versionlock(this, &versionlock_type),
-    dir(0),
-    version(0), projected_version(0) {
-    g_num_dn++;
-    g_num_dna++;
+    name(n)
+  {
     linkage.remote_ino = ino;
     linkage.remote_d_type = dt;
   }
-  ~CDentry() {
-    g_num_dn--;
-    g_num_dns++;
-  }
 
-
-  static void *operator new(size_t num_bytes) {
-    void *n = pool.malloc();
-    if (!n)
-      throw std::bad_alloc();
-    return n;
-  }
-  void operator delete(void *p) {
-    pool.free(p);
-  }
-
-  const char *pin_name(int p) const {
+  const char *pin_name(int p) const override {
     switch (p) {
     case PIN_INODEPIN: return "inodepin";
     case PIN_FRAGMENTING: return "fragmenting";
@@ -152,9 +137,9 @@ public:
   // -- wait --
   //static const int WAIT_LOCK_OFFSET = 8;
 
-  void add_waiter(uint64_t tag, MDSInternalContextBase *c);
+  void add_waiter(uint64_t tag, MDSInternalContextBase *c) override;
 
-  bool is_lt(const MDSCacheObject *r) const {
+  bool is_lt(const MDSCacheObject *r) const override {
     return *this < *static_cast<const CDentry*>(r);
   }
 
@@ -164,7 +149,7 @@ public:
 
   const CDir *get_dir() const { return dir; }
   CDir *get_dir() { return dir; }
-  const std::string& get_name() const { return name; }
+  std::string_view get_name() const { return std::string_view(name); }
 
   __u32 get_hash() const { return hash; }
 
@@ -176,9 +161,7 @@ public:
     projected.push_back(linkage_t());
     return &projected.back();
   }
-  void push_projected_linkage() {
-    _project_linkage();
-  }
+  void push_projected_linkage();
   void push_projected_linkage(inodeno_t ino, char d_type) {
     linkage_t *p = _project_linkage();
     p->remote_ino = ino;
@@ -214,21 +197,21 @@ public:
   }
 
   // ref counts: pin ourselves in the LRU when we're pinned.
-  void first_get() {
+  void first_get() override {
     lru_pin();
   }
-  void last_put() {
+  void last_put() override {
     lru_unpin();
   }
-  void _put();
+  void _put() override;
 
   // auth pins
-  bool can_auth_pin() const;
-  void auth_pin(void *by);
-  void auth_unpin(void *by);
+  bool can_auth_pin(int *err_ret=nullptr) const override;
+  void auth_pin(void *by) override;
+  void auth_unpin(void *by) override;
   void adjust_nested_auth_pins(int adjustment, int diradj, void *by);
-  bool is_frozen() const;
-  bool is_freezing() const;
+  bool is_frozen() const override;
+  bool is_freezing() const override;
   int get_num_dir_auth_pins() const;
   
   // remote links
@@ -249,7 +232,7 @@ public:
   version_t get_projected_version() const { return projected_version; }
   void set_projected_version(version_t v) { projected_version = v; }
   
-  mds_authority_t authority() const;
+  mds_authority_t authority() const override;
 
   version_t pre_dirty(version_t min=0);
   void _mark_dirty(LogSegment *ls);
@@ -261,30 +244,30 @@ public:
   void clear_new() { state_clear(STATE_NEW); }
   
   // -- replication
-  void encode_replica(mds_rank_t mds, bufferlist& bl) {
+  void encode_replica(mds_rank_t mds, bufferlist& bl, bool need_recover) {
     if (!is_replicated())
       lock.replicate_relax();
 
     __u32 nonce = add_replica(mds);
-    ::encode(nonce, bl);
-    ::encode(first, bl);
-    ::encode(linkage.remote_ino, bl);
-    ::encode(linkage.remote_d_type, bl);
-    __s32 ls = lock.get_replica_state();
-    ::encode(ls, bl);
+    encode(nonce, bl);
+    encode(first, bl);
+    encode(linkage.remote_ino, bl);
+    encode(linkage.remote_d_type, bl);
+    lock.encode_state_for_replica(bl);
+    encode(need_recover, bl);
   }
-  void decode_replica(bufferlist::iterator& p, bool is_new);
+  void decode_replica(bufferlist::const_iterator& p, bool is_new);
 
   // -- exporting
   // note: this assumes the dentry already exists.  
   // i.e., the name is already extracted... so we just need the other state.
   void encode_export(bufferlist& bl) {
-    ::encode(first, bl);
-    ::encode(state, bl);
-    ::encode(version, bl);
-    ::encode(projected_version, bl);
-    ::encode(lock, bl);
-    ::encode(replica_map, bl);
+    encode(first, bl);
+    encode(state, bl);
+    encode(version, bl);
+    encode(projected_version, bl);
+    encode(lock, bl);
+    encode(get_replicas(), bl);
     get(PIN_TEMPEXPORTING);
   }
   void finish_export() {
@@ -299,32 +282,33 @@ public:
   void abort_export() {
     put(PIN_TEMPEXPORTING);
   }
-  void decode_import(bufferlist::iterator& blp, LogSegment *ls) {
-    ::decode(first, blp);
+  void decode_import(bufferlist::const_iterator& blp, LogSegment *ls) {
+    decode(first, blp);
     __u32 nstate;
-    ::decode(nstate, blp);
-    ::decode(version, blp);
-    ::decode(projected_version, blp);
-    ::decode(lock, blp);
-    ::decode(replica_map, blp);
+    decode(nstate, blp);
+    decode(version, blp);
+    decode(projected_version, blp);
+    decode(lock, blp);
+    decode(get_replicas(), blp);
 
     // twiddle
-    state = 0;
+    state &= MASK_STATE_IMPORT_KEPT;
     state_set(CDentry::STATE_AUTH);
     if (nstate & STATE_DIRTY)
       _mark_dirty(ls);
-    if (!replica_map.empty())
+    if (is_replicated())
       get(PIN_REPLICATED);
+    replica_nonce = 0;
   }
 
   // -- locking --
-  SimpleLock* get_lock(int type) {
-    assert(type == CEPH_LOCK_DN);
+  SimpleLock* get_lock(int type) override {
+    ceph_assert(type == CEPH_LOCK_DN);
     return &lock;
   }
-  void set_object_info(MDSCacheObjectInfo &info);
-  void encode_lock_state(int type, bufferlist& bl);
-  void decode_lock_state(int type, bufferlist& bl);
+  void set_object_info(MDSCacheObjectInfo &info) override;
+  void encode_lock_state(int type, bufferlist& bl) override;
+  void decode_lock_state(int type, const bufferlist& bl) override;
 
   // ---------------------------------------------
   // replicas (on clients)
@@ -354,26 +338,25 @@ public:
   void remove_client_lease(ClientLease *r, Locker *locker);  // returns remaining mask (if any), and kicks locker eval_gathers
   void remove_client_leases(Locker *locker);
 
-  ostream& print_db_line_prefix(ostream& out);
-  void print(ostream& out);
+  ostream& print_db_line_prefix(ostream& out) override;
+  void print(ostream& out) override;
   void dump(Formatter *f) const;
 
 
-  std::string name;
   __u32 hash;
   snapid_t first, last;
 
-  elist<CDentry*>::item item_dirty;
+  elist<CDentry*>::item item_dirty, item_dir_dirty;
   elist<CDentry*>::item item_stray;
 
   // lock
   static LockType lock_type;
   static LockType versionlock_type;
 
-  SimpleLock lock;
-  LocalLock versionlock;
+  SimpleLock lock; // FIXME referenced containers not in mempool
+  LocalLock versionlock; // FIXME referenced containers not in mempool
 
-  map<client_t,ClientLease*> client_lease_map;
+  mempool::mds_co::map<client_t,ClientLease*> client_lease_map;
 
 
 protected:
@@ -384,22 +367,15 @@ protected:
   friend class CInode;
   friend class C_MDC_XlockRequest;
 
-  CDir *dir;     // containing dirfrag
+  CDir *dir = nullptr;     // containing dirfrag
   linkage_t linkage;
-  list<linkage_t> projected;
+  mempool::mds_co::list<linkage_t> projected;
 
-  version_t version;  // dir version when last touched.
-  version_t projected_version;  // what it will be when i unlock/commit.
-
+  version_t version = 0;  // dir version when last touched.
+  version_t projected_version = 0;  // what it will be when i unlock/commit.
 
 private:
-  /*
-   * This class uses a boost::pool to handle allocation. This is *not*
-   * thread-safe, so don't do allocations from multiple threads!
-   *
-   * Alternatively, switch the pool to use a boost::singleton_pool.
-   */
-  static boost::pool<> pool;
+  mempool::mds_co::string name;
 };
 
 ostream& operator<<(ostream& out, const CDentry& dn);

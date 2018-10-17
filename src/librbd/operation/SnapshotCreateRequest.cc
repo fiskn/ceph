@@ -5,11 +5,11 @@
 #include "librbd/operation/SnapshotCreateRequest.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "librbd/AioImageRequestWQ.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/ObjectMap.h"
 #include "librbd/Utils.h"
+#include "librbd/io/ImageRequestWQ.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -20,53 +20,17 @@ namespace operation {
 
 using util::create_async_context_callback;
 using util::create_context_callback;
-using util::create_rados_safe_callback;
-
-namespace {
-
-template <typename ImageCtxT>
-struct C_CreateSnapId: public Context {
-  ImageCtxT &image_ctx;
-  uint64_t *snap_id;
-  Context *on_finish;
-
-  C_CreateSnapId(ImageCtxT &image_ctx, uint64_t *snap_id, Context *on_finish)
-    : image_ctx(image_ctx), snap_id(snap_id), on_finish(on_finish) {
-  }
-
-  virtual void finish(int r) {
-    r = image_ctx.md_ctx.selfmanaged_snap_create(snap_id);
-    on_finish->complete(r);
-  }
-};
-
-template <typename ImageCtxT>
-struct C_RemoveSnapId: public Context {
-  ImageCtxT &image_ctx;
-  uint64_t snap_id;
-  Context *on_finish;
-
-  C_RemoveSnapId(ImageCtxT &image_ctx, uint64_t snap_id, Context *on_finish)
-    : image_ctx(image_ctx), snap_id(snap_id), on_finish(on_finish) {
-  }
-
-  virtual void finish(int r) {
-    r = image_ctx.md_ctx.selfmanaged_snap_remove(snap_id);
-    on_finish->complete(r);
-  }
-};
-
-} // anonymous namespace
+using util::create_rados_callback;
 
 template <typename I>
 SnapshotCreateRequest<I>::SnapshotCreateRequest(I &image_ctx,
                                                 Context *on_finish,
-                                                const std::string &snap_name,
 						const cls::rbd::SnapshotNamespace &snap_namespace,
+                                                const std::string &snap_name,
                                                 uint64_t journal_op_tid,
                                                 bool skip_object_map)
-  : Request<I>(image_ctx, on_finish, journal_op_tid), m_snap_name(snap_name),
-  m_snap_namespace(snap_namespace),
+  : Request<I>(image_ctx, on_finish, journal_op_tid),
+    m_snap_namespace(snap_namespace), m_snap_name(snap_name),
     m_skip_object_map(skip_object_map), m_ret_val(0), m_snap_id(CEPH_NOSNAP) {
 }
 
@@ -99,12 +63,12 @@ Context *SnapshotCreateRequest<I>::handle_suspend_requests(int *result) {
 template <typename I>
 void SnapshotCreateRequest<I>::send_suspend_aio() {
   I &image_ctx = this->m_image_ctx;
-  assert(image_ctx.owner_lock.is_locked());
+  ceph_assert(image_ctx.owner_lock.is_locked());
 
   CephContext *cct = image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << dendl;
 
-  image_ctx.aio_work_queue->block_writes(create_context_callback<
+  image_ctx.io_work_queue->block_writes(create_context_callback<
     SnapshotCreateRequest<I>,
     &SnapshotCreateRequest<I>::handle_suspend_aio>(this));
 }
@@ -117,7 +81,7 @@ Context *SnapshotCreateRequest<I>::handle_suspend_aio(int *result) {
 
   if (*result < 0) {
     lderr(cct) << "failed to block writes: " << cpp_strerror(*result) << dendl;
-    image_ctx.aio_work_queue->unblock_writes();
+    image_ctx.io_work_queue->unblock_writes();
     return this->create_context_finisher(*result);
   }
 
@@ -146,7 +110,7 @@ Context *SnapshotCreateRequest<I>::handle_append_op_event(int *result) {
   ldout(cct, 5) << this << " " << __func__ << ": r=" << *result << dendl;
 
   if (*result < 0) {
-    image_ctx.aio_work_queue->unblock_writes();
+    image_ctx.io_work_queue->unblock_writes();
     lderr(cct) << "failed to commit journal entry: " << cpp_strerror(*result)
                << dendl;
     return this->create_context_finisher(*result);
@@ -162,11 +126,11 @@ void SnapshotCreateRequest<I>::send_allocate_snap_id() {
   CephContext *cct = image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << dendl;
 
-  // TODO create an async version of selfmanaged_snap_create
-  image_ctx.op_work_queue->queue(new C_CreateSnapId<I>(
-    image_ctx, &m_snap_id, create_context_callback<
-      SnapshotCreateRequest<I>,
-      &SnapshotCreateRequest<I>::handle_allocate_snap_id>(this)), 0);
+  librados::AioCompletion *rados_completion = create_rados_callback<
+    SnapshotCreateRequest<I>,
+    &SnapshotCreateRequest<I>::handle_allocate_snap_id>(this);
+  image_ctx.data_ctx.aio_selfmanaged_snap_create(&m_snap_id, rados_completion);
+  rados_completion->release();
 }
 
 template <typename I>
@@ -178,7 +142,7 @@ Context *SnapshotCreateRequest<I>::handle_allocate_snap_id(int *result) {
 
   if (*result < 0) {
     save_result(result);
-    image_ctx.aio_work_queue->unblock_writes();
+    image_ctx.io_work_queue->unblock_writes();
     lderr(cct) << "failed to allocate snapshot id: " << cpp_strerror(*result)
                << dendl;
     return this->create_context_finisher(*result);
@@ -199,8 +163,8 @@ void SnapshotCreateRequest<I>::send_create_snap() {
   RWLock::RLocker parent_locker(image_ctx.parent_lock);
 
   // should have been canceled prior to releasing lock
-  assert(image_ctx.exclusive_lock == nullptr ||
-         image_ctx.exclusive_lock->is_lock_owner());
+  ceph_assert(image_ctx.exclusive_lock == nullptr ||
+              image_ctx.exclusive_lock->is_lock_owner());
 
   // save current size / parent info for creating snapshot record in ImageCtx
   m_size = image_ctx.size;
@@ -213,12 +177,12 @@ void SnapshotCreateRequest<I>::send_create_snap() {
     cls_client::snapshot_add(&op, m_snap_id, m_snap_name, m_snap_namespace);
   }
 
-  librados::AioCompletion *rados_completion = create_rados_safe_callback<
+  librados::AioCompletion *rados_completion = create_rados_callback<
     SnapshotCreateRequest<I>,
     &SnapshotCreateRequest<I>::handle_create_snap>(this);
   int r = image_ctx.md_ctx.aio_operate(image_ctx.header_oid,
                                        rados_completion, &op);
-  assert(r == 0);
+  ceph_assert(r == 0);
   rados_completion->release();
 }
 
@@ -244,13 +208,12 @@ template <typename I>
 Context *SnapshotCreateRequest<I>::send_create_object_map() {
   I &image_ctx = this->m_image_ctx;
 
-  update_snap_context();
-
   image_ctx.snap_lock.get_read();
   if (image_ctx.object_map == nullptr || m_skip_object_map) {
     image_ctx.snap_lock.put_read();
 
-    image_ctx.aio_work_queue->unblock_writes();
+    update_snap_context();
+    image_ctx.io_work_queue->unblock_writes();
     return this->create_context_finisher(0);
   }
 
@@ -274,9 +237,14 @@ Context *SnapshotCreateRequest<I>::handle_create_object_map(int *result) {
   CephContext *cct = image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": r=" << *result << dendl;
 
-  assert(*result == 0);
+  update_snap_context();
+  image_ctx.io_work_queue->unblock_writes();
+  if (*result < 0) {
+    lderr(cct) << this << " " << __func__ << ": failed to snapshot object map: "
+               << cpp_strerror(*result) << dendl;
+    return this->create_context_finisher(*result);
+  }
 
-  image_ctx.aio_work_queue->unblock_writes();
   return this->create_context_finisher(0);
 }
 
@@ -286,13 +254,13 @@ void SnapshotCreateRequest<I>::send_release_snap_id() {
   CephContext *cct = image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << dendl;
 
-  assert(m_snap_id != CEPH_NOSNAP);
+  ceph_assert(m_snap_id != CEPH_NOSNAP);
 
-  // TODO create an async version of selfmanaged_snap_remove
-  image_ctx.op_work_queue->queue(new C_RemoveSnapId<I>(
-    image_ctx, m_snap_id, create_context_callback<
-      SnapshotCreateRequest<I>,
-      &SnapshotCreateRequest<I>::handle_release_snap_id>(this)), 0);
+  librados::AioCompletion *rados_completion = create_rados_callback<
+    SnapshotCreateRequest<I>,
+    &SnapshotCreateRequest<I>::handle_release_snap_id>(this);
+  image_ctx.data_ctx.aio_selfmanaged_snap_remove(m_snap_id, rados_completion);
+  rados_completion->release();
 }
 
 template <typename I>
@@ -301,10 +269,10 @@ Context *SnapshotCreateRequest<I>::handle_release_snap_id(int *result) {
   CephContext *cct = image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": r=" << *result << dendl;
 
-  assert(m_ret_val < 0);
+  ceph_assert(m_ret_val < 0);
   *result = m_ret_val;
 
-  image_ctx.aio_work_queue->unblock_writes();
+  image_ctx.io_work_queue->unblock_writes();
   return this->create_context_finisher(m_ret_val);
 }
 
@@ -326,12 +294,14 @@ void SnapshotCreateRequest<I>::update_snap_context() {
   ldout(cct, 5) << this << " " << __func__ << dendl;
 
   // should have been canceled prior to releasing lock
-  assert(image_ctx.exclusive_lock == nullptr ||
-         image_ctx.exclusive_lock->is_lock_owner());
+  ceph_assert(image_ctx.exclusive_lock == nullptr ||
+              image_ctx.exclusive_lock->is_lock_owner());
 
   // immediately add a reference to the new snapshot
-  image_ctx.add_snap(m_snap_name, m_snap_namespace, m_snap_id, m_size, m_parent_info,
-                     RBD_PROTECTION_STATUS_UNPROTECTED, 0);
+  utime_t snap_time = ceph_clock_now();
+  image_ctx.add_snap(m_snap_namespace, m_snap_name, m_snap_id, m_size,
+		     m_parent_info, RBD_PROTECTION_STATUS_UNPROTECTED,
+		     0, snap_time);
 
   // immediately start using the new snap context if we
   // own the exclusive lock
@@ -344,6 +314,17 @@ void SnapshotCreateRequest<I>::update_snap_context() {
   image_ctx.snapc.snaps.swap(snaps);
   image_ctx.data_ctx.selfmanaged_snap_set_write_ctx(
     image_ctx.snapc.seq, image_ctx.snaps);
+
+  if (!image_ctx.migration_info.empty()) {
+    auto it = image_ctx.migration_info.snap_map.find(CEPH_NOSNAP);
+    ceph_assert(it != image_ctx.migration_info.snap_map.end());
+    ceph_assert(!it->second.empty());
+    if (it->second[0] == CEPH_NOSNAP) {
+      ldout(cct, 5) << this << " " << __func__
+                    << ": updating migration snap_map" << dendl;
+      it->second[0] = m_snap_id;
+    }
+  }
 }
 
 } // namespace operation

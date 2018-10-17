@@ -1,12 +1,12 @@
 #ifndef QUEUE_RING_H
 #define QUEUE_RING_H
 
-#include <list>
-#include <vector>
 #include "common/Mutex.h"
 #include "common/Cond.h"
 
-
+#include <list>
+#include <atomic>
+#include <vector>
 
 template <class T>
 class QueueRing {
@@ -21,40 +21,42 @@ class QueueRing {
     }
 
     void enqueue(const T& entry) {
-      lock.Lock();
+      lock.lock();
       if (entries.empty()) {
         cond.Signal();
       }
       entries.push_back(entry);
-      lock.Unlock();
+      lock.unlock();
     }
 
     void dequeue(T *entry) {
-      lock.Lock();
+      lock.lock();
       if (entries.empty()) {
         cond.Wait(lock);
       };
-      assert(!entries.empty());
+      ceph_assert(!entries.empty());
       *entry = entries.front();
       entries.pop_front();
-      lock.Unlock();
+      lock.unlock();
     };
   };
 
   std::vector<QueueBucket> buckets;
   int num_buckets;
-  atomic_t cur_read_bucket;
-  atomic_t cur_write_bucket;
+
+  std::atomic<int64_t> cur_read_bucket = { 0 };
+  std::atomic<int64_t> cur_write_bucket = { 0 };
+
 public:
   QueueRing(int n) : buckets(n), num_buckets(n) {
   }
 
   void enqueue(const T& entry) {
-    buckets[cur_write_bucket.inc() % num_buckets].enqueue(entry);
+    buckets[++cur_write_bucket % num_buckets].enqueue(entry);
   };
 
   void dequeue(T *entry) {
-    buckets[cur_read_bucket.inc() % num_buckets].dequeue(entry);
+    buckets[++cur_read_bucket % num_buckets].dequeue(entry);
   }
 };
 

@@ -5,23 +5,28 @@
 
 #include "rgw_common.h"
 #include "rgw_auth.h"
+#include "rgw_quota.h"
 #include "rgw_user.h"
 #include "rgw_http_client.h"
 #include "rgw_keystone.h"
 
 #include "include/str_list.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
 
-std::unique_ptr<RGWIdentityApplier>
-rgw_auth_transform_old_authinfo(req_state * const s)
+namespace rgw {
+namespace auth {
+
+std::unique_ptr<rgw::auth::Identity>
+transform_old_authinfo(const req_state* const s)
 {
   /* This class is not intended for public use. Should be removed altogether
    * with this function after moving all our APIs to the new authentication
    * infrastructure. */
-  class RGWDummyIdentityApplier : public RGWIdentityApplier {
-    CephContext * const cct;
+  class DummyIdentityApplier : public rgw::auth::Identity {
+    CephContext* const cct;
 
     /* For this particular case it's OK to use rgw_user structure to convey
      * the identity info as this was the policy for doing that before the
@@ -29,53 +34,83 @@ rgw_auth_transform_old_authinfo(req_state * const s)
     const rgw_user id;
     const int perm_mask;
     const bool is_admin;
+    const uint32_t type;
   public:
-    RGWDummyIdentityApplier(CephContext * const cct,
-                            const rgw_user& auth_id,
-                            const int perm_mask,
-                            const bool is_admin)
+    DummyIdentityApplier(CephContext* const cct,
+                         const rgw_user& auth_id,
+                         const int perm_mask,
+                         const bool is_admin,
+                         const uint32_t type)
       : cct(cct),
         id(auth_id),
         perm_mask(perm_mask),
-        is_admin(is_admin) {
+        is_admin(is_admin),
+        type(type) {
     }
 
-    uint32_t get_perms_from_aclspec(const aclspec_t& aclspec) const {
+    uint32_t get_perms_from_aclspec(const DoutPrefixProvider* dpp, const aclspec_t& aclspec) const override {
       return rgw_perms_from_aclspec_default_strategy(id, aclspec);
     }
 
-    bool is_admin_of(const rgw_user& acct_id) const {
+    bool is_admin_of(const rgw_user& acct_id) const override {
       return is_admin;
     }
 
-    bool is_owner_of(const rgw_user& acct_id) const {
+    bool is_owner_of(const rgw_user& acct_id) const override {
       return id == acct_id;
     }
 
-    uint32_t get_perm_mask() const {
+    bool is_identity(const idset_t& ids) const override {
+      for (auto& p : ids) {
+	if (p.is_wildcard()) {
+	  return true;
+	} else if (p.is_tenant() && p.get_tenant() == id.tenant) {
+	  return true;
+	} else if (p.is_user() &&
+		   (p.get_tenant() == id.tenant) &&
+		   (p.get_id() == id.id)) {
+	  return true;
+	}
+      }
+      return false;
+    }
+
+    uint32_t get_perm_mask() const override {
       return perm_mask;
     }
 
-    void to_str(std::ostream& out) const {
+    uint32_t get_identity_type() const override {
+      return type;
+    }
+
+    string get_acct_name() const override {
+      return {};
+    }
+
+    void to_str(std::ostream& out) const override {
       out << "RGWDummyIdentityApplier(auth_id=" << id
           << ", perm_mask=" << perm_mask
           << ", is_admin=" << is_admin << ")";
     }
   };
 
-  return std::unique_ptr<RGWIdentityApplier>(
-        new RGWDummyIdentityApplier(s->cct,
-                                    s->user->user_id,
-                                    s->perm_mask,
+  return std::unique_ptr<rgw::auth::Identity>(
+        new DummyIdentityApplier(s->cct,
+                                 s->user->user_id,
+                                 s->perm_mask,
   /* System user has admin permissions by default - it's supposed to pass
    * through any security check. */
-                                    s->system_request));
+                                 s->system_request,
+                                 s->user->type));
 }
+
+} /* namespace auth */
+} /* namespace rgw */
 
 
 uint32_t rgw_perms_from_aclspec_default_strategy(
   const rgw_user& uid,
-  const RGWIdentityApplier::aclspec_t& aclspec)
+  const rgw::auth::Identity::aclspec_t& aclspec)
 {
   dout(5) << "Searching permissions for uid=" << uid <<  dendl;
 
@@ -90,8 +125,204 @@ uint32_t rgw_perms_from_aclspec_default_strategy(
 }
 
 
-/* RGWRemoteAuthApplier */
-uint32_t RGWRemoteAuthApplier::get_perms_from_aclspec(const aclspec_t& aclspec) const
+static inline const std::string make_spec_item(const std::string& tenant,
+                                               const std::string& id)
+{
+  return tenant + ":" + id;
+}
+
+
+static inline std::pair<bool, rgw::auth::Engine::result_t>
+strategy_handle_rejected(rgw::auth::Engine::result_t&& engine_result,
+                         const rgw::auth::Strategy::Control policy,
+                         rgw::auth::Engine::result_t&& strategy_result)
+{
+  using Control = rgw::auth::Strategy::Control;
+  switch (policy) {
+    case Control::REQUISITE:
+      /* Don't try next. */
+      return std::make_pair(false, std::move(engine_result));
+
+    case Control::SUFFICIENT:
+      /* Don't try next. */
+      return std::make_pair(false, std::move(engine_result));
+
+    case Control::FALLBACK:
+      /* Don't try next. */
+      return std::make_pair(false, std::move(strategy_result));
+
+    default:
+      /* Huh, memory corruption? */
+      ceph_abort();
+  }
+}
+
+static inline std::pair<bool, rgw::auth::Engine::result_t>
+strategy_handle_denied(rgw::auth::Engine::result_t&& engine_result,
+                       const rgw::auth::Strategy::Control policy,
+                       rgw::auth::Engine::result_t&& strategy_result)
+{
+  using Control = rgw::auth::Strategy::Control;
+  switch (policy) {
+    case Control::REQUISITE:
+      /* Don't try next. */
+      return std::make_pair(false, std::move(engine_result));
+
+    case Control::SUFFICIENT:
+      /* Just try next. */
+      return std::make_pair(true, std::move(engine_result));
+
+    case Control::FALLBACK:
+      return std::make_pair(true, std::move(strategy_result));
+
+    default:
+      /* Huh, memory corruption? */
+      ceph_abort();
+  }
+}
+
+static inline std::pair<bool, rgw::auth::Engine::result_t>
+strategy_handle_granted(rgw::auth::Engine::result_t&& engine_result,
+                        const rgw::auth::Strategy::Control policy,
+                        rgw::auth::Engine::result_t&& strategy_result)
+{
+  using Control = rgw::auth::Strategy::Control;
+  switch (policy) {
+    case Control::REQUISITE:
+      /* Try next. */
+      return std::make_pair(true, std::move(engine_result));
+
+    case Control::SUFFICIENT:
+      /* Don't try next. */
+      return std::make_pair(false, std::move(engine_result));
+
+    case Control::FALLBACK:
+      /* Don't try next. */
+      return std::make_pair(false, std::move(engine_result));
+
+    default:
+      /* Huh, memory corruption? */
+      ceph_abort();
+  }
+}
+
+rgw::auth::Engine::result_t
+rgw::auth::Strategy::authenticate(const DoutPrefixProvider* dpp, const req_state* const s) const
+{
+  result_t strategy_result = result_t::deny();
+
+  for (const stack_item_t& kv : auth_stack) {
+    const rgw::auth::Engine& engine = kv.first;
+    const auto& policy = kv.second;
+
+    ldpp_dout(dpp, 20) << get_name() << ": trying " << engine.get_name() << dendl;
+
+    result_t engine_result = result_t::deny();
+    try {
+      engine_result = engine.authenticate(dpp, s);
+    } catch (const int err) {
+      engine_result = result_t::deny(err);
+    }
+
+    bool try_next = true;
+    switch (engine_result.get_status()) {
+      case result_t::Status::REJECTED: {
+        ldpp_dout(dpp, 20) << engine.get_name() << " rejected with reason="
+                 << engine_result.get_reason() << dendl;
+
+        std::tie(try_next, strategy_result) = \
+          strategy_handle_rejected(std::move(engine_result), policy,
+                                   std::move(strategy_result));
+        break;
+      }
+      case result_t::Status::DENIED: {
+        ldpp_dout(dpp, 20) << engine.get_name() << " denied with reason="
+                 << engine_result.get_reason() << dendl;
+
+        std::tie(try_next, strategy_result) = \
+          strategy_handle_denied(std::move(engine_result), policy,
+                                 std::move(strategy_result));
+        break;
+      }
+      case result_t::Status::GRANTED: {
+        ldpp_dout(dpp, 20) << engine.get_name() << " granted access" << dendl;
+
+        std::tie(try_next, strategy_result) = \
+          strategy_handle_granted(std::move(engine_result), policy,
+                                  std::move(strategy_result));
+        break;
+      }
+      default: {
+        ceph_abort();
+      }
+    }
+
+    if (! try_next) {
+      break;
+    }
+  }
+
+  return strategy_result;
+}
+
+int
+rgw::auth::Strategy::apply(const DoutPrefixProvider *dpp, const rgw::auth::Strategy& auth_strategy,
+                           req_state* const s) noexcept
+{
+  try {
+    auto result = auth_strategy.authenticate(dpp, s);
+    if (result.get_status() != decltype(result)::Status::GRANTED) {
+      /* Access denied is acknowledged by returning a std::unique_ptr with
+       * nullptr inside. */
+      ldpp_dout(dpp, 5) << "Failed the auth strategy, reason="
+                       << result.get_reason() << dendl;
+      return result.get_reason();
+    }
+
+    try {
+      rgw::auth::IdentityApplier::aplptr_t applier = result.get_applier();
+      rgw::auth::Completer::cmplptr_t completer = result.get_completer();
+
+      /* Account used by a given RGWOp is decoupled from identity employed
+       * in the authorization phase (RGWOp::verify_permissions). */
+      applier->load_acct_info(dpp, *s->user);
+      s->perm_mask = applier->get_perm_mask();
+
+      /* This is the single place where we pass req_state as a pointer
+       * to non-const and thus its modification is allowed. In the time
+       * of writing only RGWTempURLEngine needed that feature. */
+      applier->modify_request_state(dpp, s);
+      if (completer) {
+        completer->modify_request_state(dpp, s);
+      }
+
+      s->auth.identity = std::move(applier);
+      s->auth.completer = std::move(completer);
+
+      return 0;
+    } catch (const int err) {
+      ldpp_dout(dpp, 5) << "applier throwed err=" << err << dendl;
+      return err;
+    }
+  } catch (const int err) {
+    ldpp_dout(dpp, 5) << "auth engine throwed err=" << err << dendl;
+    return err;
+  }
+
+  /* We never should be here. */
+  return -EPERM;
+}
+
+void
+rgw::auth::Strategy::add_engine(const Control ctrl_flag,
+                                const Engine& engine) noexcept
+{
+  auth_stack.push_back(std::make_pair(std::cref(engine), ctrl_flag));
+}
+
+
+/* rgw::auth::RemoteAuthApplier */
+uint32_t rgw::auth::RemoteApplier::get_perms_from_aclspec(const DoutPrefixProvider* dpp, const aclspec_t& aclspec) const
 {
   uint32_t perm = 0;
 
@@ -114,16 +345,16 @@ uint32_t RGWRemoteAuthApplier::get_perms_from_aclspec(const aclspec_t& aclspec) 
     perm |= extra_acl_strategy(aclspec);
   }
 
-  ldout(cct, 20) << "from ACL got perm=" << perm << dendl;
+  ldpp_dout(dpp, 20) << "from ACL got perm=" << perm << dendl;
   return perm;
 }
 
-bool RGWRemoteAuthApplier::is_admin_of(const rgw_user& uid) const
+bool rgw::auth::RemoteApplier::is_admin_of(const rgw_user& uid) const
 {
   return info.is_admin;
 }
 
-bool RGWRemoteAuthApplier::is_owner_of(const rgw_user& uid) const
+bool rgw::auth::RemoteApplier::is_owner_of(const rgw_user& uid) const
 {
   if (info.acct_user.tenant.empty()) {
     const rgw_user tenanted_acct_user(info.acct_user.id, info.acct_user.id);
@@ -136,16 +367,40 @@ bool RGWRemoteAuthApplier::is_owner_of(const rgw_user& uid) const
   return info.acct_user == uid;
 }
 
-void RGWRemoteAuthApplier::to_str(std::ostream& out) const
+bool rgw::auth::RemoteApplier::is_identity(const idset_t& ids) const {
+  for (auto& id : ids) {
+    if (id.is_wildcard()) {
+      return true;
+
+      // We also need to cover cases where rgw_keystone_implicit_tenants
+      // was enabled. */
+    } else if (id.is_tenant() &&
+	       (info.acct_user.tenant.empty() ?
+		info.acct_user.id :
+		info.acct_user.tenant) == id.get_tenant()) {
+      return true;
+    } else if (id.is_user() &&
+	       info.acct_user.id == id.get_id() &&
+	       (info.acct_user.tenant.empty() ?
+		info.acct_user.id :
+		info.acct_user.tenant) == id.get_tenant()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void rgw::auth::RemoteApplier::to_str(std::ostream& out) const
 {
-  out << "RGWRemoteAuthApplier(acct_user=" << info.acct_user
+  out << "rgw::auth::RemoteApplier(acct_user=" << info.acct_user
       << ", acct_name=" << info.acct_name
       << ", perm_mask=" << info.perm_mask
       << ", is_admin=" << info.is_admin << ")";
 }
 
-void RGWRemoteAuthApplier::create_account(const rgw_user& acct_user,
-                                          RGWUserInfo& user_info) const      /* out */
+void rgw::auth::RemoteApplier::create_account(const DoutPrefixProvider* dpp,
+                                              const rgw_user& acct_user,
+                                              RGWUserInfo& user_info) const      /* out */
 {
   rgw_user new_acct_user = acct_user;
 
@@ -154,26 +409,30 @@ void RGWRemoteAuthApplier::create_account(const rgw_user& acct_user,
     user_info.type = info.acct_type;
   }
 
-  /* Administrator may enforce creating new accounts within their own tenants.
-   * The config parameter name is kept due to legacy. */
-  if (new_acct_user.tenant.empty() && g_conf->rgw_keystone_implicit_tenants) {
+  /* An upper layer may enforce creating new accounts within their own
+   * tenants. */
+  if (new_acct_user.tenant.empty() && implicit_tenants) {
     new_acct_user.tenant = new_acct_user.id;
   }
 
   user_info.user_id = new_acct_user;
   user_info.display_name = info.acct_name;
 
+  user_info.max_buckets = cct->_conf->rgw_user_max_buckets;
+  rgw_apply_default_bucket_quota(user_info.bucket_quota, cct->_conf);
+  rgw_apply_default_user_quota(user_info.user_quota, cct->_conf);
+
   int ret = rgw_store_user_info(store, user_info, nullptr, nullptr,
                                 real_time(), true);
   if (ret < 0) {
-    ldout(cct, 0) << "ERROR: failed to store new user info: user="
+    ldpp_dout(dpp, 0) << "ERROR: failed to store new user info: user="
                   << user_info.user_id << " ret=" << ret << dendl;
     throw ret;
   }
 }
 
 /* TODO(rzarzynski): we need to handle display_name changes. */
-void RGWRemoteAuthApplier::load_acct_info(RGWUserInfo& user_info) const      /* out */
+void rgw::auth::RemoteApplier::load_acct_info(const DoutPrefixProvider* dpp, RGWUserInfo& user_info) const      /* out */
 {
   /* It's supposed that RGWRemoteAuthApplier tries to load account info
    * that belongs to the authenticated identity. Another policy may be
@@ -201,46 +460,60 @@ void RGWRemoteAuthApplier::load_acct_info(RGWUserInfo& user_info) const      /* 
   }
 
   if (rgw_get_user_info_by_uid(store, acct_user, user_info) < 0) {
-    ldout(cct, 0) << "NOTICE: couldn't map swift user " << acct_user << dendl;
-    create_account(acct_user, user_info);
+    ldpp_dout(dpp, 0) << "NOTICE: couldn't map swift user " << acct_user << dendl;
+    create_account(dpp, acct_user, user_info);
   }
 
   /* Succeeded if we are here (create_account() hasn't throwed). */
 }
 
-
-/* LocalAuthApplier */
+/* rgw::auth::LocalApplier */
 /* static declaration */
-const std::string RGWLocalAuthApplier::NO_SUBUSER;
+const std::string rgw::auth::LocalApplier::NO_SUBUSER;
 
-uint32_t RGWLocalAuthApplier::get_perms_from_aclspec(const aclspec_t& aclspec) const
+uint32_t rgw::auth::LocalApplier::get_perms_from_aclspec(const DoutPrefixProvider* dpp, const aclspec_t& aclspec) const
 {
   return rgw_perms_from_aclspec_default_strategy(user_info.user_id, aclspec);
 }
 
-bool RGWLocalAuthApplier::is_admin_of(const rgw_user& uid) const
+bool rgw::auth::LocalApplier::is_admin_of(const rgw_user& uid) const
 {
   return user_info.admin || user_info.system;
 }
 
-bool RGWLocalAuthApplier::is_owner_of(const rgw_user& uid) const
+bool rgw::auth::LocalApplier::is_owner_of(const rgw_user& uid) const
 {
   return uid == user_info.user_id;
 }
 
-void RGWLocalAuthApplier::to_str(std::ostream& out) const
-{
-  out << "RGWLocalAuthApplier(acct_user=" << user_info.user_id
+bool rgw::auth::LocalApplier::is_identity(const idset_t& ids) const {
+  for (auto& id : ids) {
+    if (id.is_wildcard()) {
+      return true;
+    } else if (id.is_tenant() &&
+	       id.get_tenant() == user_info.user_id.tenant) {
+      return true;
+    } else if (id.is_user() &&
+	       (id.get_tenant() == user_info.user_id.tenant) &&
+	       (id.get_id() == user_info.user_id.id)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void rgw::auth::LocalApplier::to_str(std::ostream& out) const {
+  out << "rgw::auth::LocalApplier(acct_user=" << user_info.user_id
       << ", acct_name=" << user_info.display_name
       << ", subuser=" << subuser
       << ", perm_mask=" << get_perm_mask()
-      << ", is_admin=" << user_info.admin << ")";
+      << ", is_admin=" << static_cast<bool>(user_info.admin) << ")";
 }
 
-uint32_t RGWLocalAuthApplier::get_perm_mask(const std::string& subuser_name,
-                                            const RGWUserInfo &uinfo) const
+uint32_t rgw::auth::LocalApplier::get_perm_mask(const std::string& subuser_name,
+                                                const RGWUserInfo &uinfo) const
 {
-  if (!subuser_name.empty() && subuser_name != NO_SUBUSER) {
+  if (! subuser_name.empty() && subuser_name != NO_SUBUSER) {
     const auto iter = uinfo.subusers.find(subuser_name);
 
     if (iter != std::end(uinfo.subusers)) {
@@ -255,256 +528,41 @@ uint32_t RGWLocalAuthApplier::get_perm_mask(const std::string& subuser_name,
   }
 }
 
-void RGWLocalAuthApplier::load_acct_info(RGWUserInfo& user_info) const      /* out */
+void rgw::auth::LocalApplier::load_acct_info(const DoutPrefixProvider* dpp, RGWUserInfo& user_info) const /* out */
 {
   /* Load the account that belongs to the authenticated identity. An extra call
    * to RADOS may be safely skipped in this case. */
   user_info = this->user_info;
 }
 
-
-RGWAuthApplier::aplptr_t RGWAnonymousAuthEngine::authenticate() const
+void rgw::auth::LocalApplier::modify_request_state(const DoutPrefixProvider *dpp, req_state* s) const
 {
-  RGWUserInfo user_info;
-  rgw_get_anon_user(user_info);
-
-  return apl_factory->create_apl_local(cct, user_info,
-                                       RGWLocalAuthApplier::NO_SUBUSER);
-}
-
-
-/* Keystone */
-bool RGWKeystoneAuthEngine::is_applicable() const noexcept
-{
-  if (! RGWTokenBasedAuthEngine::is_applicable()) {
-    return false;
-  }
-
-  return ! cct->_conf->rgw_keystone_url.empty();
-}
-
-KeystoneToken RGWKeystoneAuthEngine::decode_pki_token(const std::string& token) const
-{
-  bufferlist token_body_bl;
-  int ret = rgw_decode_b64_cms(cct, token, token_body_bl);
-  if (ret < 0) {
-    ldout(cct, 20) << "cannot decode pki token" << dendl;
-    throw ret;
-  } else {
-    ldout(cct, 20) << "successfully decoded pki token" << dendl;
-  }
-
-  KeystoneToken token_body;
-  ret = token_body.parse(cct, token, token_body_bl);
-  if (ret < 0) {
-    throw ret;
-  }
-
-  return token_body;
-}
-
-KeystoneToken RGWKeystoneAuthEngine::get_from_keystone(const std::string& token) const
-{
-  using RGWValidateKeystoneToken = KeystoneService::RGWValidateKeystoneToken;
-
-  bufferlist token_body_bl;
-  RGWValidateKeystoneToken validate(cct, &token_body_bl);
-
-  std::string url;
-  if (KeystoneService::get_keystone_url(cct, url) < 0) {
-    throw -EINVAL;
-  }
-
-  const auto keystone_version = KeystoneService::get_api_version();
-  if (keystone_version == KeystoneApiVersion::VER_2) {
-    url.append("v2.0/tokens/" + token);
-  } else if (keystone_version == KeystoneApiVersion::VER_3) {
-    url.append("v3/auth/tokens");
-    validate.append_header("X-Subject-Token", token);
-  }
-
-  std::string admin_token;
-  if (KeystoneService::get_keystone_admin_token(cct, admin_token) < 0) {
-    throw -EINVAL;
-  }
-
-  validate.append_header("X-Auth-Token", admin_token);
-  validate.set_send_length(0);
-
-  int ret = validate.process(url.c_str());
-  if (ret < 0) {
-    throw ret;
-  }
-
-  /* NULL terminate for debug output. */
-  token_body_bl.append(static_cast<char>(0));
-  ldout(cct, 20) << "received response status=" << validate.get_http_status()
-                 << ", body=" << token_body_bl.c_str() << dendl;
-
-  /* Detect Keystone rejection earlier than during the token parsing.
-   * Although failure at the parsing phase doesn't impose a threat,
-   * this allows to return proper error code (EACCESS instead of EINVAL
-   * or similar) and thus improves logging. */
-  if (validate.get_http_status() ==
-          /* Most likely: wrong admin credentials or admin token. */
-          RGWValidateKeystoneToken::HTTP_STATUS_UNAUTHORIZED ||
-      validate.get_http_status() ==
-          /* Most likely: non-existent token supplied by the client. */
-          RGWValidateKeystoneToken::HTTP_STATUS_NOTFOUND) {
-    throw -EACCES;
-  }
-
-  KeystoneToken token_body;
-  ret = token_body.parse(cct, token, token_body_bl);
-  if (ret < 0) {
-    throw ret;
-  }
-
-  return token_body;
-}
-
-RGWRemoteAuthApplier::AuthInfo
-RGWKeystoneAuthEngine::get_creds_info(const KeystoneToken& token,
-                                      const std::vector<std::string>& admin_roles
-                                    ) const noexcept
-{
-  using acct_privilege_t = RGWRemoteAuthApplier::AuthInfo::acct_privilege_t;
-
-  /* Check whether the user has an admin status. */
-  acct_privilege_t level = acct_privilege_t::IS_PLAIN_ACCT;
-  for (const auto& admin_role : admin_roles) {
-    if (token.has_role(admin_role)) {
-      level = acct_privilege_t::IS_ADMIN_ACCT;
-      break;
-    }
-  }
-
-  return RGWRemoteAuthApplier::AuthInfo {
-    /* Suggested account name for the authenticated user. */
-    rgw_user(token.get_project_id()),
-    /* User's display name (aka real name). */
-    token.get_project_name(),
-    /* Keystone doesn't support RGW's subuser concept, so we cannot cut down
-     * the access rights through the perm_mask. At least at this layer. */
-    RGW_PERM_FULL_CONTROL,
-    level,
-  };
-}
-
-static inline const std::string make_spec_item(const std::string& tenant,
-                                               const std::string& id)
-{
-  return tenant + ":" + id;
-}
-
-RGWKeystoneAuthEngine::acl_strategy_t
-RGWKeystoneAuthEngine::get_acl_strategy(const KeystoneToken& token) const
-{
-  /* The primary identity is constructed upon UUIDs. */
-  const auto& tenant_uuid = token.get_project_id();
-  const auto& user_uuid = token.get_user_id();
-
-  /* For Keystone v2 an alias may be also used. */
-  const auto& tenant_name = token.get_project_name();
-  const auto& user_name = token.get_user_name();
-
-  /* Construct all possible combinations including Swift's wildcards. */
-  const std::array<std::string, 6> allowed_items = {
-    make_spec_item(tenant_uuid, user_uuid),
-    make_spec_item(tenant_name, user_name),
-
-    /* Wildcards. */
-    make_spec_item(tenant_uuid, "*"),
-    make_spec_item(tenant_name, "*"),
-    make_spec_item("*", user_uuid),
-    make_spec_item("*", user_name),
-  };
-
-  /* Lambda will obtain a copy of (not a reference to!) allowed_items. */
-  return [allowed_items](const RGWIdentityApplier::aclspec_t& aclspec) {
-    uint32_t perm = 0;
-
-    for (const auto& allowed_item : allowed_items) {
-      const auto iter = aclspec.find(allowed_item);
-
-      if (std::end(aclspec) != iter) {
-        perm |= iter->second;
-      }
-    }
-
-    return perm;
-  };
-}
-
-RGWAuthApplier::aplptr_t RGWKeystoneAuthEngine::authenticate() const
-{
-  KeystoneToken t;
-
-  /* This will be initialized on the first call to this method. In C++11 it's
-   * also thread-safe. */
-  static struct RolesCacher {
-    RolesCacher(CephContext * const cct) {
-      get_str_vec(cct->_conf->rgw_keystone_accepted_roles, plain);
-      get_str_vec(cct->_conf->rgw_keystone_accepted_admin_roles, admin);
-
-      /* Let's suppose that having an admin role implies also a regular one. */
-      plain.insert(std::end(plain), std::begin(admin), std::end(admin));
-    }
-
-    std::vector<std::string> plain;
-    std::vector<std::string> admin;
-  } roles(cct);
-
-  /* Token ID is a concept that makes dealing with PKI tokens more effective.
-   * Instead of storing several kilobytes, a short hash can be burried. */
-  const auto& token_id = rgw_get_token_id(token);
-  ldout(cct, 20) << "token_id=" << token_id << dendl;
-
-  /* Check cache first. */
-  if (RGWKeystoneTokenCache::get_instance().find(token_id, t)) {
-    ldout(cct, 20) << "cached token.project.id=" << t.get_project_id()
-                   << dendl;
-      return apl_factory->create_apl_remote(cct,
-                                            get_acl_strategy(t),
-                                            get_creds_info(t, roles.admin));
-  }
-
-  /* Retrieve token. */
-  if (rgw_is_pki_token(token)) {
+  for (auto it : role_policies) {
     try {
-      t = decode_pki_token(token);
-    } catch (...) {
-      /* Last resort. */
-      t = get_from_keystone(token);
+      bufferlist bl = bufferlist::static_from_string(it);
+      const rgw::IAM::Policy p(s->cct, s->user->user_id.tenant, bl);
+      s->iam_user_policies.push_back(std::move(p));
+    } catch (rgw::IAM::PolicyParseException& e) {
+      //Control shouldn't reach here as the policy has already been
+      //verified earlier
+      ldpp_dout(dpp, 20) << "failed to parse policy: " << e.what() << dendl;
     }
+  }
+}
+
+rgw::auth::Engine::result_t
+rgw::auth::AnonymousEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* const s) const
+{
+  if (! is_applicable(s)) {
+    return result_t::deny(-EPERM);
   } else {
-    /* Can't decode, just go to the Keystone server for validation. */
-    t = get_from_keystone(token);
+    RGWUserInfo user_info;
+    rgw_get_anon_user(user_info);
+
+    auto apl = \
+      apl_factory->create_apl_local(cct, s, user_info,
+                                    rgw::auth::LocalApplier::NO_SUBUSER,
+                                    boost::none, boost::none);
+    return result_t::grant(std::move(apl));
   }
-
-  /* Verify expiration. */
-  if (t.expired()) {
-    ldout(cct, 0) << "got expired token: " << t.get_project_name()
-                  << ":" << t.get_user_name()
-                  << " expired: " << t.get_expires() << dendl;
-    return nullptr;
-  }
-
-  /* Check for necessary roles. */
-  for (const auto& role : roles.plain) {
-    if (t.has_role(role) == true) {
-      ldout(cct, 0) << "validated token: " << t.get_project_name()
-                    << ":" << t.get_user_name()
-                    << " expires: " << t.get_expires() << dendl;
-      RGWKeystoneTokenCache::get_instance().add(token_id, t);
-      return apl_factory->create_apl_remote(cct,
-                                            get_acl_strategy(t),
-                                            get_creds_info(t, roles.admin));
-    }
-  }
-
-  ldout(cct, 0) << "user does not hold a matching role; required roles: "
-                << g_conf->rgw_keystone_accepted_roles << dendl;
-
-  return nullptr;
 }

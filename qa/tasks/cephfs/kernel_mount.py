@@ -7,15 +7,19 @@ from teuthology import misc
 
 from teuthology.orchestra import remote as orchestra_remote
 from teuthology.orchestra import run
+from teuthology.contextutil import MaxWhileTries
 from .mount import CephFSMount
 
 log = logging.getLogger(__name__)
 
 
+UMOUNT_TIMEOUT = 300
+
+
 class KernelMount(CephFSMount):
-    def __init__(self, mons, test_dir, client_id, client_remote,
+    def __init__(self, ctx, mons, test_dir, client_id, client_remote,
                  ipmi_user, ipmi_password, ipmi_domain):
-        super(KernelMount, self).__init__(test_dir, client_id, client_remote)
+        super(KernelMount, self).__init__(ctx, test_dir, client_id, client_remote)
         self.mons = mons
 
         self.mounted = False
@@ -42,6 +46,8 @@ class KernelMount(CephFSMount):
         )
 
     def mount(self, mount_path=None, mount_fs_name=None):
+        self.setupfs(name=mount_fs_name)
+
         log.info('Mounting kclient client.{id} at {remote} {mnt}...'.format(
             id=self.client_id, remote=self.client_remote, mnt=self.mountpoint))
 
@@ -87,28 +93,40 @@ class KernelMount(CephFSMount):
 
         self.mounted = True
 
-    def umount(self):
+    def umount(self, force=False):
         log.debug('Unmounting client client.{id}...'.format(id=self.client_id))
-        self.client_remote.run(
-            args=[
+
+        cmd=['sudo', 'umount', self.mountpoint]
+        if force:
+            cmd.append('-f')
+
+        try:
+            self.client_remote.run(args=cmd, timeout=(5*60))
+        except Exception as e:
+            self.client_remote.run(args=[
                 'sudo',
-                'umount',
-                self.mountpoint,
-            ],
-        )
-        self.client_remote.run(
+                run.Raw('PATH=/usr/sbin:$PATH'),
+                'lsof',
+                run.Raw(';'),
+                'ps', 'auxf',
+            ])
+            raise e
+
+        rproc = self.client_remote.run(
             args=[
                 'rmdir',
                 '--',
                 self.mountpoint,
             ],
+            wait=False
         )
+        run.wait([rproc], UMOUNT_TIMEOUT)
         self.mounted = False
 
     def cleanup(self):
         pass
 
-    def umount_wait(self, force=False, require_clean=False):
+    def umount_wait(self, force=False, require_clean=False, timeout=900):
         """
         Unlike the fuse client, the kernel client's umount is immediate
         """
@@ -116,8 +134,8 @@ class KernelMount(CephFSMount):
             return
 
         try:
-            self.umount()
-        except CommandFailedError:
+            self.umount(force)
+        except (CommandFailedError, MaxWhileTries):
             if not force:
                 raise
 
@@ -245,10 +263,7 @@ class KernelMount(CephFSMount):
         """
         osd_map = self._read_debug_file("osdmap")
         lines = osd_map.split("\n")
-        epoch = int(lines[0].split()[1])
+        first_line_tokens = lines[0].split()
+        epoch, barrier = int(first_line_tokens[1]), int(first_line_tokens[3])
 
-        mds_sessions = self._read_debug_file("mds_sessions")
-        lines = mds_sessions.split("\n")
-        epoch_barrier = int(lines[2].split()[1].strip('"'))
-
-        return epoch, epoch_barrier
+        return epoch, barrier

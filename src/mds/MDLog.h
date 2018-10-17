@@ -41,6 +41,7 @@ enum {
 #include "include/types.h"
 #include "include/Context.h"
 
+#include "MDSContext.h"
 #include "common/Thread.h"
 #include "common/Cond.h"
 
@@ -89,7 +90,7 @@ protected:
     MDLog *log;
   public:
     explicit ReplayThread(MDLog *l) : log(l) {}
-    void* entry() {
+    void* entry() override {
       log->_replay_thread();
       return 0;
     }
@@ -99,7 +100,7 @@ protected:
   friend class ReplayThread;
   friend class C_MDL_Replay;
 
-  list<MDSInternalContextBase*> waitfor_replay;
+  MDSInternalContextBase::vec waitfor_replay;
 
   void _replay();         // old way
   void _replay_thread();  // new way
@@ -111,7 +112,7 @@ protected:
   public:
     void set_completion(MDSInternalContextBase *c) {completion = c;}
     explicit RecoveryThread(MDLog *l) : log(l), completion(NULL) {}
-    void* entry() {
+    void* entry() override {
       log->_recovery_thread(completion);
       return 0;
     }
@@ -142,7 +143,7 @@ protected:
   void set_safe_pos(uint64_t pos)
   {
     Mutex::Locker l(submit_mutex);
-    assert(pos >= safe_pos);
+    ceph_assert(pos >= safe_pos);
     safe_pos = pos;
   }
   friend class MDSLogContextBase;
@@ -152,7 +153,7 @@ protected:
     MDLog *log;
   public:
     explicit SubmitThread(MDLog *l) : log(l) {}
-    void* entry() {
+    void* entry() override {
       log->_submit_thread();
       return 0;
     }
@@ -171,7 +172,7 @@ protected:
   friend class MDCache;
 
   uint64_t get_last_segment_seq() const {
-    assert(!segments.empty());
+    ceph_assert(!segments.empty());
     return segments.rbegin()->first;
   }
   LogSegment *get_oldest_segment() {
@@ -237,7 +238,7 @@ public:
   }
 
   LogSegment *get_current_segment() { 
-    assert(!segments.empty());
+    ceph_assert(!segments.empty());
     return segments.rbegin()->second;
   }
 
@@ -306,6 +307,7 @@ private:
 
   friend class C_MaybeExpiredSegment;
   friend class C_MDL_Flushed;
+  friend class C_OFT_Committed;
 
 public:
   void trim_expired_segments();

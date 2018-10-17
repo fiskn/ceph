@@ -4,11 +4,11 @@
 #ifndef CEPH_COMMON_SLOPPYCRCMAP_H
 #define CEPH_COMMON_SLOPPYCRCMAP_H
 
-#include "include/types.h"
 #include "include/encoding.h"
 
-#include <map>
-#include <ostream>
+namespace ceph {
+class Formatter;
+}
 
 /**
  * SloppyCRCMap
@@ -67,9 +67,9 @@ public:
   int read(uint64_t offset, uint64_t len, const bufferlist& bl, std::ostream *err);
 
   void encode(bufferlist& bl) const;
-  void decode(bufferlist::iterator& bl);
-  void dump(Formatter *f) const;
-  static void generate_test_instances(list<SloppyCRCMap*>& ls);
+  void decode(bufferlist::const_iterator& bl);
+  void dump(ceph::Formatter *f) const;
+  static void generate_test_instances(std::list<SloppyCRCMap*>& ls);
 };
 WRITE_CLASS_ENCODER(SloppyCRCMap)
 
